@@ -77,9 +77,13 @@ To wire a different window into `ai chat`, replace `cmd_chat` in `bin/ai`. Keep 
 ## Develop
 
 ```bash
-shellcheck -s bash bin/ai install.sh
+shellcheck -s bash bin/ai install.sh tests/*.sh tests/stubs/*
+bash tests/run.sh              # routing, modes, keys, memory, incognito
+bash tests/clean_slate.sh      # install -> use -> uninstall leaves no trace
 AI_RAM_GB=16 bin/ai models     # preview another machine's picks
 bin/ai check
 ```
+
+If you add anything that creates files or changes the machine, record it in the receipt (see `record` in install.sh and `rc_record` in bin/ai) and undo it in `cmd_uninstall`. `tests/clean_slate.sh` will fail until you do.
 
 `bin/ai` must stay compatible with macOS's bash 3.2: no associative arrays, `mapfile` or `${var,,}`, and use `${arr[@]+"${arr[@]}"}` for arrays that may be empty.

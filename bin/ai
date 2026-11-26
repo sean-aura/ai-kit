@@ -18,6 +18,7 @@ KIT="$(cd "$(dirname "$SELF")/.." && pwd)"
 CFG_DIR="${AIKIT_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ai-kit}"
 CFG_FILE="$CFG_DIR/config"
 KEYS_FILE="$CFG_DIR/keys.env"
+RECEIPT="$CFG_DIR/receipt"   # what ai-kit added vs found; see install.sh
 DATA="${AI_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/ai-kit}"
 CTX="${AI_CTX:-$AI_CTX_DEFAULT}"
 # AI_OLLAMA_ADDR points the kit at an Ollama server elsewhere (e.g. a team GPU
@@ -26,7 +27,13 @@ OLLAMA_ADDR="${AI_OLLAMA_ADDR:-$OLLAMA_ADDR}"
 OLLAMA_URL="http://$OLLAMA_ADDR"
 KEYCHAIN_SERVICE="ai-kit"
 OS="$(uname -s)"
-mkdir -p "$DATA" && chmod 700 "$DATA"
+# Folders are created only when something is written, so read-only commands
+# (help, receipt, a dry run) leave no trace.
+data_dir()  { mkdir -p "$DATA" && chmod 700 "$DATA"; }
+space_dir() {
+  data_dir; mkdir -p "$SPACE" && chmod 700 "$SPACE"
+  if [ "$INCOGNITO" = 1 ]; then chmod 700 "$DATA/incognito"; fi
+}
 
 # ------------------------------------------------------------------- helpers
 say()  { printf '%s\n' "$*"; }
@@ -69,13 +76,12 @@ SPACE=""
 space_init() {
   if [ "$INCOGNITO" = 1 ]; then
     local d
-    mkdir -p "$DATA/incognito"; chmod 700 "$DATA/incognito"
     for d in "$DATA"/incognito/*; do   # remove leftovers from sessions that were killed
       [ -d "$d" ] || continue
       kill -0 "$(basename "$d")" 2>/dev/null || rm -rf "$d"
     done
     SPACE="$DATA/incognito/$$"
-    add_cleanup "rm -rf '$SPACE'"
+    add_cleanup "rm -rf '$SPACE'; rmdir '$DATA/incognito' 2>/dev/null || true"
   else
     SPACE="$DATA/spaces/$MODE"
     # one-time move of pre-spaces data into the local space
@@ -85,7 +91,6 @@ space_init() {
       [ -d "$DATA/llm" ] && mv "$DATA/llm" "$DATA/spaces/local/llm"
     fi
   fi
-  mkdir -p "$SPACE"; chmod 700 "$SPACE"
 }
 space_name() { if [ "$INCOGNITO" = 1 ]; then echo "incognito"; else echo "$MODE"; fi; }
 
@@ -154,6 +159,17 @@ resolve() {
 
 norm() { case "$1" in *:*) echo "$1" ;; *) echo "$1:latest" ;; esac; }
 
+# ---- receipt: kind|name|added or preexisting (or replaced/modified)|detail. First record wins.
+rc_get() { if [ -f "$RECEIPT" ]; then awk -F'|' -v k="$1" -v n="$2" '$1 == k && $2 == n && !d { print $3 "|" $4; d = 1 }' "$RECEIPT"; fi; }
+rc_record() {
+  [ -n "$(rc_get "$1" "$2")" ] && return 0
+  mkdir -p "$CFG_DIR"
+  printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "${4:-}" >>"$RECEIPT"
+}
+rc_names() { if [ -f "$RECEIPT" ]; then awk -F'|' -v k="$1" -v s="$2" '$1 == k && $3 == s { print $2 }' "$RECEIPT"; fi; }
+rc_status() { local r; r="$(rc_get "$1" "$2")"; echo "${r%%|*}"; }
+rc_detail() { local r; r="$(rc_get "$1" "$2")"; echo "${r#*|}"; }
+
 # ------------------------------------------------------------------- keys
 key_get() {
   local v="$1" val=""
@@ -202,6 +218,7 @@ start_server() {
   server_up && return 0
   case "$OLLAMA_ADDR" in 127.0.0.1:*|localhost:*) ;; *) die "Ollama at $OLLAMA_ADDR is not reachable (AI_OLLAMA_ADDR)";; esac
   have ollama || die "ollama not found. Re-run install.sh"
+  data_dir
   # Ollama's own cloud models and web search are always off: cloud use goes
   # through providers.conf, where the mode can gate it.
   OLLAMA_NO_CLOUD=1 OLLAMA_HOST="$OLLAMA_ADDR" OLLAMA_CONTEXT_LENGTH="$CTX" \
@@ -264,7 +281,7 @@ memory_text() {
 # so models.conf and providers.conf stay the only things you edit.
 write_llm_config() {
   local d="$SPACE/llm" p m url
-  mkdir -p "$d"
+  space_dir; mkdir -p "$d"
   { model_rows | awk -F'|' '{ print $2 "|" $3 }'; echo "$1|$2"; } | sort -u |
   while IFS='|' read -r p m; do
     url="$(prov_url "$p")"
@@ -346,6 +363,7 @@ cmd_chat() {   # web UI: ai chat [role|model]
   add_cleanup stop_server
   trap 'exit 130' INT TERM
 
+  space_dir
   # A stable secret, kept with the data instead of in the current directory.
   secret="$SPACE/webui-secret"
   if [ ! -s "$secret" ]; then
@@ -444,7 +462,9 @@ cmd_image() {   # ai image [--cloud] [-o dir] "description"
   if [ "$p" = ollama ]; then
     is_mac || die "Ollama image generation is macOS-only for now. Use: ai image --cloud \"...\" (hybrid mode)"
     prepare "$p"
+    if is_installed "$m"; then rc_record ollama_model "$(norm "$m")" preexisting; fi
     (cd "$out" && ollama run "$m" "$*")
+    if is_installed "$m"; then rc_record ollama_model "$(norm "$m")" added; fi
   elif [ "$p" = openai ]; then
     prepare "$p"
     f="$out/image-$(date +%Y%m%d-%H%M%S).png"
@@ -498,20 +518,34 @@ cmd_sync() {   # ai sync [--all]
   done
   wanted_models "$all" | while IFS='|' read -r role m; do
     if [ "$role" = image ] && ! is_mac; then say "skip   $m (image generation is macOS-only)"; continue; fi
+    if is_installed "$m"; then rc_record ollama_model "$(norm "$m")" preexisting; fi
     say "pull   $m  ($role)"
-    ollama pull "$m" </dev/null || say "FAILED $m - check the tag in models.conf"
+    if ollama pull "$m" </dev/null; then rc_record ollama_model "$(norm "$m")" added
+    else say "FAILED $m - check the tag in models.conf"; fi
   done
 }
 
-cmd_prune() {   # remove Ollama models not listed in models.conf
+cmd_prune() {   # ai prune [--all]: remove local models no longer in models.conf
+  local everything=0 approved extra m kept=""
+  [ "${1:-}" = --all ] && everything=1
   start_server
-  local approved extra m
   approved="$(model_rows | awk -F'|' '$2 == "ollama" { print $3 }' | while read -r m; do norm "$m"; done)"
-  extra="$(installed_models | while read -r m; do echo "$approved" | grep -qxF "$m" || echo "$m"; done)"
-  [ -n "$extra" ] || { say "Nothing to prune: every installed model is listed in models.conf."; return 0; }
-  say "Installed but not in models.conf:"; printf '%s\n' "$extra" | while read -r m; do say "  $m"; done
+  extra=""
+  for m in $(installed_models); do
+    echo "$approved" | grep -qxF "$m" && continue
+    if [ "$everything" = 1 ] || [ "$(rc_status ollama_model "$m")" = added ]; then extra="$extra$m
+"
+    else kept="$kept  $m
+"; fi
+  done
+  if [ -n "$kept" ]; then
+    say "Not listed in models.conf, but left alone because ai-kit didn't download them (ai prune --all to include):"
+    printf '%s' "$kept"
+  fi
+  [ -n "$extra" ] || { say "Nothing to prune."; return 0; }
+  say "Will remove:"; printf '%s' "$extra" | while read -r m; do say "  $m"; done
   confirm "Remove them? Type yes:" yes || { say "Cancelled."; return 0; }
-  echo "$extra" | while read -r m; do ollama rm "$m"; done
+  printf '%s' "$extra" | while read -r m; do ollama rm "$m"; done
 }
 
 cmd_models() {   # ai models | ai models --remote PROVIDER
@@ -644,6 +678,7 @@ cmd_log() {   # ai log [on|off]  - terminal prompt history (llm's database)
 cmd_remember() {   # ai remember "fact"
   [ "$INCOGNITO" = 1 ] && die "incognito sessions don't remember anything"
   [ $# -gt 0 ] || die "usage: ai remember \"something to keep in mind\""
+  space_dir
   ( umask 077; printf '%s\n' "$*" | tr '\n' ' ' | sed 's/ *$//' >>"$(mem_file)"; echo >>"$(mem_file)" )
   say "Remembered in the $(space_name) space (#$(wc -l <"$(mem_file)" | tr -d ' ')). Used by ai ask and ai repl in $(space_name) mode."
 }
@@ -744,6 +779,7 @@ cmd_doctor() {
 # ------------------------------------------------------------ data lifecycle
 cmd_backup() {   # backs up every space (chats, uploads, terminal memory and logs)
   [ -d "$DATA/spaces" ] || { say "No chat data to back up."; return 0; }
+  data_dir
   mkdir -p "$DATA/backups"
   local f; f="$DATA/backups/spaces-$(date +%Y%m%d-%H%M%S).tgz"
   ( umask 077; tar -czf "$f" -C "$DATA" spaces )
@@ -808,35 +844,174 @@ cmd_verify() {
 cmd_export() { local f="${1:-ai-models-$(date +%Y%m%d).tar}"; tar -cf "$f" -C "$HOME/.ollama" models && say "Wrote $f"; }
 cmd_import() {
   [ -f "${1:-}" ] || die "usage: ai import <file.tar>"
+  local before m
+  start_server; before="$(installed_models)"
   stop_server; mkdir -p "$HOME/.ollama"; tar -xf "$1" -C "$HOME/.ollama"
+  start_server
+  for m in $(installed_models); do
+    if echo "$before" | grep -qxF "$m"; then rc_record ollama_model "$m" preexisting; else rc_record ollama_model "$m" added; fi
+  done
   say "Imported. Run: ai verify"
 }
 
-cmd_uninstall() {   # ai uninstall [--all]
-  local all=0 rc v p
-  [ "${1:-}" = --all ] && all=1
-  say "This removes: the ai command, Open WebUI and llm (uv tools), and your chat data in $DATA."
-  [ $all = 1 ] && say "With --all it also removes: downloaded models (~/.ollama/models), stored API keys, and $CFG_DIR."
-  confirm "Type UNINSTALL to continue:" UNINSTALL || { say "Cancelled."; return 1; }
-  stop_webui; stop_server
-  have uv && { uv tool uninstall open-webui >/dev/null 2>&1 || true; uv tool uninstall llm >/dev/null 2>&1 || true; }
-  if [ -L "$HOME/.local/bin/ai" ]; then rm -f "$HOME/.local/bin/ai"; fi
-  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
-    [ -f "$rc" ] && grep -q '# ai-kit$' "$rc" && sed -i.ai-kit-bak '/# ai-kit$/d' "$rc"
+cmd_receipt() {
+  [ -f "$RECEIPT" ] || { say "No receipt at $RECEIPT (installed before receipts existed, or never installed)."; return 0; }
+  say "Added by ai-kit (removed by 'ai uninstall --all'):"
+  awk -F'|' '$3 == "added" { printf "  %-13s %s%s\n", $1, $2, ($1 == "dir" ? "  (if empty)" : "") }' "$RECEIPT"
+  say "Changed by ai-kit (restored on uninstall):"
+  awk -F'|' '$3 == "replaced" || $3 == "modified" { printf "  %-13s %s (%s)\n", $1, $2, $3 }' "$RECEIPT"
+  say "Already here before ai-kit (never removed):"
+  awk -F'|' '$3 == "preexisting" { printf "  %-13s %s\n", $1, $2 }' "$RECEIPT"
+}
+
+# Uninstall works from the receipt: it removes only what ai-kit added and puts
+# back what it changed. Without a receipt it only removes ai-kit's own files.
+DRY=0
+act() {   # act "description" command...
+  if [ "$DRY" = 1 ]; then say "  would: $1"; return 0; fi
+  local d="$1"; shift
+  if "$@"; then say "  done:  $d"; else warn "could not: $d"; fi
+}
+rmdir_if_empty() { [ -d "$1" ] && rmdir "$1" 2>/dev/null; return 0; }
+remove_rc_line() {   # rewrite without the ai-kit line; delete the file if ai-kit created it and it's now empty
+  local rc="$1"
+  [ -f "$rc" ] || return 0
+  { grep -v '# ai-kit$' "$rc" || true; } >"$rc.ai-kit-tmp"
+  cat "$rc.ai-kit-tmp" >"$rc"; rm -f "$rc.ai-kit-tmp"     # cat keeps the file's permissions
+  if [ "$(rc_detail rcline "$rc")" = new-file ] && [ ! -s "$rc" ]; then rm -f "$rc"; fi
+}
+restore_server_json() {
+  local sj="$1" st was
+  st="$(rc_status server_json "$sj")"; was="$(rc_detail server_json "$sj")"
+  [ -f "$sj" ] || return 0
+  case "$st" in
+    added)
+      jq 'del(.disable_ollama_cloud)' "$sj" >"$sj.tmp" && mv "$sj.tmp" "$sj"
+      [ "$(jq -c . "$sj")" = "{}" ] && rm -f "$sj" ;;
+    modified)
+      local orig="$CFG_DIR/originals/server.json"
+      # Unchanged apart from ai-kit's setting? Put the original back byte for byte.
+      if [ -f "$orig" ] && [ "$(jq -S -c 'del(.disable_ollama_cloud)' "$sj")" = "$(jq -S -c 'del(.disable_ollama_cloud)' "$orig")" ]; then
+        cp -p "$orig" "$sj"
+      else   # you've changed it since: revert only ai-kit's setting
+        if [ "$was" = absent ]; then jq 'del(.disable_ollama_cloud)' "$sj" >"$sj.tmp"
+        else jq --argjson v "$was" '.disable_ollama_cloud = $v' "$sj" >"$sj.tmp"; fi
+        mv "$sj.tmp" "$sj"
+      fi ;;
+  esac
+}
+no_models_left() { [ -z "$(find "$HOME/.ollama/models/manifests" -type f 2>/dev/null | head -n 1)" ]; }
+
+cmd_uninstall() {   # ai uninstall [--all] [--dry-run]
+  local all=0 x st d p v keep="" have_receipt=1
+  for x in "$@"; do
+    case "$x" in --all) all=1 ;; --dry-run) DRY=1 ;; *) die "usage: ai uninstall [--all] [--dry-run]" ;; esac
   done
-  rm -rf "$DATA"
+  [ -f "$RECEIPT" ] || { have_receipt=0; warn "no install receipt: only ai-kit's own files will be removed, no tools or models."; }
+
+  if [ "$DRY" = 1 ]; then say "Dry run. Nothing will be changed."
+  else
+    say "Removing what ai-kit added$([ $all = 1 ] && echo ', including tools, models, keys and settings').$([ $all = 0 ] && echo ' Models, keys, settings and Homebrew tools are kept (use --all for a clean slate).')"
+    say "Anything that was already here before ai-kit is left alone. Preview with: ai uninstall${1:+ $1} --dry-run"
+    confirm "Type UNINSTALL to continue:" UNINSTALL || { say "Cancelled."; return 1; }
+    stop_webui; stop_server
+  fi
+
+  # 1. models ai-kit downloaded (while Ollama is still installed)
+  if [ $all = 1 ] && [ -n "$(rc_names ollama_model added)" ]; then
+    if [ "$DRY" = 0 ]; then start_server; fi
+    for x in $(rc_names ollama_model added); do act "remove model $x" ollama rm "$x"; done
+    if [ "$DRY" = 0 ]; then stop_server; fi
+  fi
+  # 2. stored API keys
   if [ $all = 1 ]; then
-    rm -rf "$HOME/.ollama/models"
     for p in $(provider_rows | awk -F'|' '$2 == "cloud" { print $1 }'); do
       v="$(prov_keyvar "$p")"
-      is_mac && security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$v" >/dev/null 2>&1 || true
+      if is_mac && security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$v" >/dev/null 2>&1; then
+        act "delete Keychain item $KEYCHAIN_SERVICE/$v" security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$v"
+      fi
     done
-    rm -rf "$CFG_DIR"
   fi
-  say "Removed. Left in place on purpose:"
-  say "  Homebrew packages:  brew uninstall $(brew_formulae | tr '\n' ' ')"
-  say "  Ollama settings:    ~/.ollama/server.json"
-  say "  The kit itself:     rm -rf \"$KIT\""
+  # 3. uv tools and the Python versions uv downloaded for them
+  for x in $(rc_names uv_tool added); do act "uv tool uninstall $x" uv tool uninstall "$x"; done
+  if [ $all = 1 ]; then
+    for x in $(rc_names uv_python added); do act "remove Python $x (downloaded by uv)" uv python uninstall "$x"; done
+  fi
+  # 4. the ai link (put yours back) and the PATH line
+  x="$HOME/.local/bin/ai"
+  case "$(rc_status link "$x")" in
+    added)    [ -L "$x" ] && act "remove $x" rm -f "$x" ;;
+    replaced) act "restore your original $x" mv -f "$(rc_detail link "$x")" "$x" ;;
+    *)        if [ $have_receipt = 0 ] && [ -L "$x" ] && [ "$(readlink "$x")" = "$KIT/bin/ai" ]; then act "remove $x" rm -f "$x"; fi ;;
+  esac
+  for x in $(rc_names rcline added); do act "remove the ai-kit PATH line from $x" remove_rc_line "$x"; done
+  # 5. Ollama's settings file, put back as it was
+  if [ $all = 1 ]; then
+    x="$HOME/.ollama/server.json"
+    case "$(rc_status server_json "$x")" in added|modified) act "restore $x" restore_server_json "$x" ;; esac
+  fi
+  # 6. ai-kit's data (chats, uploads, memories, logs, backups)
+  act "delete ai-kit data in $DATA" rm -rf "$DATA"
+  # 7. Homebrew packages ai-kit installed, dependencies included. Never forced:
+  #    Homebrew refuses anything that something else now depends on.
+  if [ $all = 1 ]; then
+    # the package lists must split into separate names
+    x="$(rc_names brew_cask added | tr '\n' ' ' | sed 's/ $//')"
+    # shellcheck disable=SC2086
+    [ -n "${x// /}" ] && act "brew uninstall --cask $x" brew uninstall --cask $x
+    x="$(rc_names brew added | tr '\n' ' ' | sed 's/ $//')"
+    # shellcheck disable=SC2086
+    [ -n "${x// /}" ] && act "brew uninstall $x" brew uninstall $x
+  fi
+  # 8. folders that belonged to tools ai-kit installed, if nothing of yours is left in them
+  if [ $all = 1 ]; then
+    d="$HOME/.ollama"
+    if [ "$(rc_status dir "$d")" = added ] && no_models_left; then act "delete $d" rm -rf "$d"; fi
+    # uv's download cache is always safe to delete; its tools folder only if uv itself was ai-kit's
+    d="$HOME/.cache/uv"
+    if [ "$(rc_status dir "$d")" = added ] && [ -d "$d" ]; then act "delete $d (created during install)" rm -rf "$d"; fi
+    d="$HOME/.local/share/uv"
+    if [ "$(rc_status brew uv)" = added ] && [ "$(rc_status dir "$d")" = added ] && [ -d "$d" ]; then
+      act "delete $d (uv was installed by ai-kit)" rm -rf "$d"
+    fi
+  fi
+  # 9. anything new in the usual places since install, for you to check
+  if [ $all = 1 ] && [ -s "$CFG_DIR/home-snapshot" ]; then
+    local now new
+    now="$(for d in "$HOME" "$HOME/.cache" "$HOME/.config" "$HOME/.local/share" "$HOME/Library/Caches" "$HOME/Library/Application Support"; do
+             if [ -d "$d" ]; then find "$d" -mindepth 1 -maxdepth 1 -print; fi
+           done 2>/dev/null | sort)"
+    # leave out anything the receipt already accounts for
+    new="$(comm -13 "$CFG_DIR/home-snapshot" <(echo "$now") | grep -v -x -F -e "$KIT" -e "$DATA" -f <(rc_names dir added) || true)"
+    if [ -n "$new" ]; then
+      say "  check: these appeared after ai-kit was installed. They may be from ai-kit's tools or from something else, so they are not deleted:"
+      printf '%s\n' "$new" | while read -r x; do say "           $x"; done
+    fi
+  fi
+  # 10. settings and receipt last, then the checkout if the installer cloned it
+  local checkout_added=0
+  [ "$(rc_status checkout "$KIT")" = added ] && checkout_added=1
+  local dirs; dirs="$(rc_names dir added)"
+  if [ $all = 1 ]; then act "delete settings and receipt in $CFG_DIR" rm -rf "$CFG_DIR"; fi
+  # 11. empty folders ai-kit created (deepest first; never deletes anything inside)
+  for d in $(echo "$dirs" | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-); do
+    [ "$d" = "$CFG_DIR" ] && [ $all = 0 ] && continue
+    if [ "$DRY" = 1 ]; then [ -d "$d" ] && say "  would: remove $d if empty"; else rmdir_if_empty "$d"; fi
+  done
+  if [ $all = 1 ] && [ $checkout_added = 1 ]; then act "delete the kit at $KIT" rm -rf "$KIT"; fi
+
+  # What stays, and why
+  [ $have_receipt = 1 ] && [ -f "$RECEIPT" ] && keep="$(awk -F'|' '$3 == "preexisting" && $1 != "dir" { printf "  %s %s\n", $1, $2 }' "$RECEIPT")"
+  say ""
+  if [ $all = 0 ]; then
+    say "Kept: downloaded models, API keys, settings ($CFG_DIR), Homebrew tools and the kit ($KIT)."
+    say "For a clean slate: \"$KIT/bin/ai\" uninstall --all"
+  else
+    say "Left alone because they were here before ai-kit:"
+    if [ -n "$keep" ]; then printf '%s\n' "$keep"; else say "  (nothing)"; fi
+    [ $checkout_added = 1 ] || say "  the kit at $KIT (not cloned by the installer)"
+    say "Homebrew may still hold downloaded copies of removed packages: brew cleanup"
+  fi
 }
 
 # ------------------------------------------------------------ help & dispatch
@@ -885,7 +1060,9 @@ Run and maintain
   ai update                   update kit, tools and models (needs internet)
   ai lock | ai verify         record / check approved model and tool versions
   ai export | ai import f     move models without internet
-  ai uninstall [--all]        remove ai-kit (--all: models, keys and settings too)
+  ai uninstall [--all] [--dry-run]  remove what ai-kit added (--all: clean slate)
+  ai receipt                  what ai-kit added, changed, and found already here
+  ai prune --all              also remove unlisted models ai-kit didn't download
 EOF
 }
 
@@ -927,6 +1104,7 @@ main() {
     export)     cmd_export "$@" ;;
     import)     cmd_import "$@" ;;
     uninstall)  cmd_uninstall "$@" ;;
+    receipt)    cmd_receipt ;;
     help|-h|--help) usage ;;
     *)          usage; exit 1 ;;
   esac

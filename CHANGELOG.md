@@ -17,6 +17,9 @@ Reworked from the offline-only "local-ai-kit" into a local-first kit that can al
 - Explicit memory: `ai remember`, `ai memory`, `ai forget`. The chat window's background memory review is forced off.
 - Incognito mode (`ai incognito <command>` / `ai -i`): a throwaway space deleted on exit, with no memory.
 - `ai wipe [local|hybrid|all]`.
+- Install receipt (`ai receipt`). `ai uninstall [--all] [--dry-run]` removes only what ai-kit added, including Homebrew dependencies, the uv Python download, models and folders, and restores what it changed (an existing `ai` command, Ollama's settings file). `ai prune` only removes models ai-kit downloaded unless given `--all`.
+- Install no longer upgrades tools you already had.
+- Folders are created only when something is written, so `ai help` and dry runs leave no trace.
 - Linux support (best-effort, via Homebrew on Linux). `AI_OLLAMA_ADDR` for a shared GPU server.
 - MIT licence, SECURITY.md, CI (shellcheck and offline tests).
 
@@ -30,6 +33,7 @@ Reworked from the offline-only "local-ai-kit" into a local-first kit that can al
 **Fixed**
 - `ai sync` no longer lets `ollama pull` read from the loop's input.
 - Cloud API keys never appear in process arguments.
+- The installer stopped silently on machines missing a standard folder (e.g. a fresh machine with no uv Python folder).
 
 **Breaking**
 - `ai chat light|standard|heavy` is now `ai chat <role>`. Add rows named light, standard or heavy to `~/.config/ai-kit/models.conf` if you want the old names back.

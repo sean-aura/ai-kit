@@ -24,6 +24,8 @@ Please use GitHub's **private vulnerability reporting** (Security tab, then "Rep
 | Background memory review off (`ENABLE_MEMORY_BACKGROUND_REVIEW=False`); memories are only saved when the user asks | Nothing is remembered implicitly. |
 | Incognito: a throwaway space deleted on exit, memory disabled, stale sessions cleaned up on the next run | Leaves no history on disk. It uses a fresh data folder rather than Open WebUI's Temporary Chat, because Temporary Chat turns off document parsing. |
 | Models pinned by fingerprint (`ai lock` / `ai verify`) | Detects a model that was swapped or corrupted. |
+| Install receipt; uninstall removes only what ai-kit added, and restores what it changed | Removing ai-kit can't take your own tools, models or settings with it, and `--all` returns the machine to how it was. A double-install test and a byte-for-byte clean-slate test run in CI. |
+| Install never upgrades tools you already had (`brew bundle --no-upgrade`, `HOMEBREW_NO_INSTALL_UPGRADE=1`; existing uv tools untouched) | ai-kit can't silently change software it doesn't own. |
 | Nothing updates automatically | A change never lands unreviewed. `ai update` backs up chat data first. |
 
 ## Verifying it is offline

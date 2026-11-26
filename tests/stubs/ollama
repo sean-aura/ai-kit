@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Stand-in for Ollama's CLI: models are manifest files under ~/.ollama like the real store.
+M="$HOME/.ollama/models/manifests"
+tag() { case "$1" in *:*) echo "$1" ;; *) echo "$1:latest" ;; esac; }
+case "${1:-}" in
+  list) echo "NAME ID SIZE MODIFIED"
+        [ -d "$M" ] && find "$M" -type f | sed "s|^$M/||" | while read -r n; do echo "$n abc123 1GB now"; done; true ;;
+  pull|run) n="$(tag "$2")"; mkdir -p "$(dirname "$M/$n")"; echo manifest >"$M/$n" ;;
+  rm) rm -f "$M/$2"; find "$M" -mindepth 1 -type d -empty -delete 2>/dev/null; true ;;
+  --version) echo "ollama version is 0.40.16" ;;
+  ps) echo "NAME" ;;
+esac

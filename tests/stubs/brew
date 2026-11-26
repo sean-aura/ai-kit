@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Stand-in for Homebrew: keeps installed formulae/casks as files under $STUB_STATE.
+S="$STUB_STATE/brew"
+case "${1:-}" in
+  list)
+    case "${2:-}" in
+      --formula) [ -d "$S/formula" ] && ls "$S/formula"; true ;;
+      --cask)    [ -d "$S/cask" ] && ls "$S/cask"; true ;;
+      --versions) shift 2; for f in "$@"; do [ -e "$S/formula/$f" ] && echo "$f 1.0"; done; true ;;
+    esac ;;
+  bundle)
+    mkdir -p "$S/formula"
+    for a in "$@"; do case "$a" in --file=*) F="${a#--file=}" ;; esac; done
+    sed -n 's/^brew "\([^"]*\)".*/\1/p' "$F" | while read -r f; do
+      [ -e "$S/formula/$f" ] && continue
+      touch "$S/formula/$f"
+      [ "$f" = ocrmypdf ] && [ ! -e "$S/formula/tesseract" ] && touch "$S/formula/tesseract"   # a dependency
+    done
+    sed -n 's/^cask "\([^"]*\)".*/\1/p' "$F" | while read -r c; do mkdir -p "$S/cask"; touch "$S/cask/$c"; done ;;
+  uninstall)
+    shift; d=formula; [ "${1:-}" = --cask ] && { d=cask; shift; }
+    for f in "$@"; do rm -f "$S/$d/$f"; done
+    rmdir "$S/$d" "$S" 2>/dev/null; true ;;   # like Homebrew, leave no empty records
+  upgrade|cleanup|shellenv) ;;
+esac

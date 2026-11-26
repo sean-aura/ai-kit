@@ -121,7 +121,7 @@ Incognito covers this machine only. If you pick a cloud model, that provider's o
 | `ai prompt [name]` | List saved prompts, or copy one to the clipboard |
 | `ai docx file.md [template.docx]` / `ai ocr scan.pdf` | Markdown to Word / make a scanned PDF readable |
 | `ai models` / `ai which <target>` / `ai models --remote <provider>` | What each role resolves to / one target / a provider's live model list |
-| `ai sync` / `ai prune` | Download the picks for this machine / delete unlisted models |
+| `ai sync` / `ai prune [--all]` | Download the picks for this machine / delete unlisted models ai-kit downloaded |
 | `ai mode` / `ai key` / `ai log` | Local or hybrid / API keys / terminal prompt history on or off |
 | `ai remember` / `ai memory` / `ai forget` | Terminal memory for the current space |
 | `ai incognito <command>` or `ai -i <command>` | Run chat, ask or repl with nothing saved and no memory |
@@ -130,7 +130,7 @@ Incognito covers this machine only. If you pick a cloud model, that provider's o
 | `ai backup` / `ai wipe [local\|hybrid\|all]` | Back up both spaces / delete a space (or everything, including backups) |
 | `ai update` / `ai lock` / `ai verify` | Update everything / record approved versions / check against them |
 | `ai export` / `ai import` | Move models by USB to an offline machine |
-| `ai uninstall [--all]` | Remove ai-kit (`--all` also removes models, keys and settings) |
+| `ai receipt` / `ai uninstall [--all] [--dry-run]` | What ai-kit added / remove only that (`--all`: clean slate) |
 
 `-c` / `--cloud` means "use the cloud model for this role". A `target` is a role, `provider/model`, or an Ollama tag.
 
@@ -148,6 +148,21 @@ This repo ships the `security-reports` pack (gap analysis, risk assessment, envi
 
 ## Clean up
 
+The installer writes a **receipt** (`~/.config/ai-kit/receipt`) recording everything it added, and everything it found already there. That covers Homebrew packages (including the dependencies they pull in), uv tools, the Python uv downloads, models, folders, your shell profile and Ollama's settings. Uninstall works from the receipt:
+
+- **Removes only what ai-kit added.** Your own `llm`, models, Homebrew tools and settings stay, even if ai-kit uses them.
+- **Restores what it changed.** An `ai` command you already had is set aside at install and put back. Ollama's settings file is restored exactly. Only the PATH line it added is removed from your shell profile.
+- **Doesn't upgrade tools you already had.** Homebrew runs with upgrades off, and uv tools you already have aren't touched.
+- **Never forces Homebrew.** If something you installed later depends on a package ai-kit added, Homebrew refuses to remove it and ai-kit leaves it.
+
+```bash
+ai receipt                      # what ai-kit added, changed, and found already here
+ai uninstall --all --dry-run    # exactly what a clean-slate removal would do
+ai uninstall --all              # do it
+```
+
+At the end, `--all` lists anything new in your home, `~/.cache` and `~/Library` folders since install, for you to check. ai-kit doesn't delete those: they may come from other software. `tests/clean_slate.sh` installs, uses and uninstalls on a simulated fresh machine and a lived-in one (your own `llm`, `ai` script, models and settings), and checks every file is byte-for-byte as it was. CI runs it on every change.
+
 | To... | Run |
 |---|---|
 | Free RAM | `ai stop` |
@@ -155,8 +170,9 @@ This repo ships the `security-reports` pack (gap analysis, risk assessment, envi
 | Delete one space's history, uploads, memories and logs | `ai wipe local` or `ai wipe hybrid` |
 | Delete both spaces and all backups | `ai wipe` |
 | Leave nothing behind in the first place | `ai incognito chat` |
-| Remove ai-kit but keep models and keys | `ai uninstall` |
-| Remove everything | `ai uninstall --all`, then the `brew uninstall` line it prints |
+| Remove ai-kit but keep models, keys and tools | `ai uninstall` |
+| Clean slate: everything ai-kit added, nothing else | `ai uninstall --all` |
+| Free disk (models ai-kit downloaded that are no longer listed) | `ai prune` (`--all` also includes models you downloaded yourself) |
 
 ## Extending
 
@@ -170,6 +186,7 @@ Everything is a line in a text file: add a provider (any OpenAI-compatible endpo
 - **Claude through Open WebUI and `ai ask` uses Anthropic's OpenAI-compatible endpoint**, which Anthropic describes as a way to test and compare models. Features such as prompt caching aren't available there. For heavier Claude use, `ai code --cloud` (Claude Code) talks to Anthropic natively.
 - **Local image generation** relies on Ollama's experimental, macOS-only support.
 - **"Remember this" in the chat window** needs a model with native tool calling, and it's unconfirmed whether ai-kit's `ENABLE_PLUGINS=False` also switches off Open WebUI's built-in memory tools. Adding memories by hand in Settings > Personalization works either way. Check on the pilot.
+- **Clean slate is proven with stand-ins, not yet on a real Mac.** The test uses stand-ins for Homebrew, uv and Ollama. Open WebUI may write caches the stand-ins don't model (for example under `~/.cache` or `~/Library`). `ai uninstall --all` lists anything like that for you to check.
 - **Terminal and chat-window memories are separate stores.** They aren't synced, even within the same space.
 
 ## Licence

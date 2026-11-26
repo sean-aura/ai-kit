@@ -16,14 +16,53 @@ REPO="${AIKIT_REPO:-https://github.com/OWNER/ai-kit.git}"
 REF="${AIKIT_REF:-main}"
 DEST="${AIKIT_HOME:-$HOME/.ai-kit}"
 
+CFG_DIR="${AIKIT_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ai-kit}"
+RECEIPT="$CFG_DIR/receipt"
+
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# ---- the receipt: what ai-kit added vs what was already here, so uninstall
+# removes only what it added. Format: kind|name|added or preexisting|detail
+# The FIRST record of an item wins, so re-running the installer can never
+# relabel something ai-kit added as "already here".
+receipt_has() { [ -f "$RECEIPT" ] && grep -q "^$1|$2|" "$RECEIPT"; }
+record() {
+  receipt_has "$1" "$2" && return 0
+  mkdir -p "$CFG_DIR"
+  printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "${4:-}" >>"$RECEIPT"
+}
+record_path() {   # record_path kind path: added unless it already exists
+  if [ -e "$2" ] || [ -L "$2" ]; then record "$1" "$2" preexisting; else record "$1" "$2" added; fi
+}
+init_receipt() {
+  # Look at everything BEFORE creating anything (the receipt's own folder included).
+  local d st lines="" snap=""
+  for d in "$HOME/.config" "$CFG_DIR" "$HOME/.local" "$HOME/.local/bin" "$HOME/.local/share" \
+           "$HOME/.cache" "$HOME/.cache/uv" "$HOME/.local/share/uv" "$HOME/.ollama"; do
+    if [ -e "$d" ]; then st=preexisting; else st=added; fi
+    lines="$lines$d|$st
+"
+  done
+  # What's in the usual places now, so uninstall can point out anything that
+  # appears later (from ai-kit's tools or from anything else).
+  if [ ! -s "$CFG_DIR/home-snapshot" ]; then
+    snap="$(for d in "$HOME" "$HOME/.cache" "$HOME/.config" "$HOME/.local/share" "$HOME/Library/Caches" "$HOME/Library/Application Support"; do
+              if [ -d "$d" ]; then find "$d" -mindepth 1 -maxdepth 1 -print; fi
+            done 2>/dev/null | sort)"
+  fi
+  mkdir -p "$CFG_DIR"
+  printf '%s' "$lines" | while IFS='|' read -r d st; do [ -n "$d" ] && record dir "$d" "$st"; done
+  [ -s "$CFG_DIR/home-snapshot" ] || printf '%s\n' "$snap" >"$CFG_DIR/home-snapshot"
+}
+
 # ---- step 1: when piped from curl, fetch the kit and re-run from the checkout.
 bootstrap() {
   have git || die "git is required (macOS: xcode-select --install)"
+  init_receipt
+  record_path checkout "$DEST"
   if [ -d "$DEST/.git" ]; then
     say "Updating $DEST ($REF)"
     git -C "$DEST" fetch --quiet --tags origin
@@ -40,6 +79,8 @@ bootstrap() {
   else exec bash "$DEST/install.sh" "$@" </dev/null; fi
 }
 
+names_in() { [ -d "$1" ] || return 0; find "$1" -mindepth 1 -maxdepth 1 -print | sed 's|.*/||' | sort; }
+
 find_brew() {
   have brew && return 0
   local b
@@ -51,9 +92,11 @@ find_brew() {
 
 # ---- step 2: install from the checkout.
 install_kit() {
-  local kit="$1"
+  local kit="$1" before after x
   # shellcheck disable=SC1091
   . "$kit/kit.conf"
+  init_receipt
+  record checkout "$kit" preexisting   # a checkout you cloned yourself is never deleted
 
   local os arch
   os="$(uname -s)"; arch="$(uname -m)"
@@ -73,34 +116,83 @@ install_kit() {
       say '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
       exit 1
     fi
-    say "Installing tools with Homebrew"
-    brew bundle --file="$kit/Brewfile"
+    say "Installing tools with Homebrew (tools you already have are left as they are)"
+    before="$( { brew list --formula -1; brew list --cask -1 | sed 's/^/cask:/'; } 2>/dev/null | sort)"
+    HOMEBREW_BUNDLE_NO_UPGRADE=1 HOMEBREW_NO_INSTALL_UPGRADE=1 brew bundle --no-upgrade --file="$kit/Brewfile"
+    after="$( { brew list --formula -1; brew list --cask -1 | sed 's/^/cask:/'; } 2>/dev/null | sort)"
+    # Everything new, including dependencies Homebrew pulled in.
+    for x in $(comm -13 <(echo "$before") <(echo "$after")); do
+      case "$x" in cask:*) record brew_cask "${x#cask:}" added ;; *) record brew "$x" added ;; esac
+    done
+    awk '/^brew "/ { gsub(/"/, "", $2); print $2 }' "$kit/Brewfile" | while read -r x; do
+      if echo "$before" | grep -qx "$x"; then record brew "$x" preexisting; fi
+    done
   fi
 
-  say "Installing Open WebUI (minimum $OPEN_WEBUI_MIN) and llm with uv"
-  uv tool install --quiet --python "$PYTHON_VERSION" "open-webui>=$OPEN_WEBUI_MIN" \
-    || uv tool upgrade --quiet open-webui
-  uv tool install --quiet --python "$PYTHON_VERSION" llm || uv tool upgrade --quiet llm
+  # Python versions uv downloads (it may fetch one for the tools below).
+  local pydir; pydir="$(uv python dir 2>/dev/null || true)"
+  before="$(names_in "$pydir")"
+  local tool spec
+  for tool in open-webui llm; do
+    spec="$tool"; [ "$tool" = open-webui ] && spec="open-webui>=$OPEN_WEBUI_MIN"
+    if receipt_has uv_tool "$tool" && grep -q "^uv_tool|$tool|added|" "$RECEIPT"; then
+      uv tool upgrade --quiet "$tool" || true                     # ours: keep it current
+    elif uv tool list 2>/dev/null | grep -q "^$tool "; then
+      record uv_tool "$tool" preexisting
+      say "$tool is already installed with uv: leaving your copy as it is"
+    elif have "$tool"; then
+      record uv_tool "$tool" preexisting external
+      say "$tool is already installed (not via uv): leaving your copy as it is"
+    else
+      say "Installing $tool with uv"
+      uv tool install --quiet --python "$PYTHON_VERSION" "$spec"
+      record uv_tool "$tool" added
+    fi
+  done
+  after="$(names_in "$pydir")"
+  for x in $(comm -13 <(echo "$before") <(echo "$after")); do
+    case "$x" in .*) ;; *) record uv_python "$x" added ;; esac
+  done
 
   say "Linking the 'ai' command into ~/.local/bin"
   chmod +x "$kit/bin/ai"
   mkdir -p "$HOME/.local/bin"
-  ln -sf "$kit/bin/ai" "$HOME/.local/bin/ai"
+  local link="$HOME/.local/bin/ai"
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$kit/bin/ai" ]; then
+    record link "$link" added                       # ours from an earlier run
+  elif [ -e "$link" ] || [ -L "$link" ]; then
+    mv "$link" "$link.pre-ai-kit"                   # set yours aside; uninstall puts it back
+    record link "$link" replaced "$link.pre-ai-kit"
+    say "Moved your existing $link to $link.pre-ai-kit (restored on uninstall)"
+  else
+    record link "$link" added
+  fi
+  ln -sf "$kit/bin/ai" "$link"
   # shellcheck disable=SC2016  # written literally into the rc file
   local rc line='export PATH="$HOME/.local/bin:$PATH"  # ai-kit'
   case "${SHELL:-}" in */zsh) rc="$HOME/.zshrc" ;; */bash) rc="$HOME/.bashrc" ;; *) rc="$HOME/.profile" ;; esac
   case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
-    *) grep -qsF '# ai-kit' "$rc" || { echo "$line" >>"$rc"; say "Added ~/.local/bin to PATH in $rc"; } ;;
+    *) if ! grep -qsF '# ai-kit' "$rc"; then
+         if [ -e "$rc" ]; then record rcline "$rc" added existing-file; else record rcline "$rc" added new-file; fi
+         echo "$line" >>"$rc"; say "Added ~/.local/bin to PATH in $rc"
+       fi ;;
   esac
 
   # Belt and braces: switch off Ollama's cloud features in its own settings
   # file too, so it also applies if the Ollama desktop app is ever started.
-  local sj="$HOME/.ollama/server.json"
+  local sj="$HOME/.ollama/server.json" old
   mkdir -p "$HOME/.ollama"
   if [ -f "$sj" ]; then
+    old="$(jq -c '.disable_ollama_cloud' "$sj" 2>/dev/null || echo null)"
+    if [ "$old" = true ]; then record server_json "$sj" preexisting
+    elif ! receipt_has server_json "$sj"; then
+      mkdir -p "$CFG_DIR/originals"; cp -p "$sj" "$CFG_DIR/originals/server.json"   # exact copy, restored on uninstall
+      record server_json "$sj" modified "$( [ "$old" = null ] && echo absent || echo "$old")"
+    fi
     jq '. + {disable_ollama_cloud: true}' "$sj" >"$sj.tmp" && mv "$sj.tmp" "$sj"
   else
+    record server_json "$sj" added
     echo '{ "disable_ollama_cloud": true }' >"$sj"
   fi
   say "Ollama cloud features disabled in $sj"
@@ -113,6 +205,8 @@ install_kit() {
   cat <<EOF
 
 ai-kit is installed in $kit  (mode: local, nothing leaves this machine)
+What it added and what it left alone is recorded in $RECEIPT
+('ai receipt' to view; 'ai uninstall --all --dry-run' to preview removal).
 
 Open a NEW terminal, then:
   ai sync       download the local models for this machine (large; needs internet)

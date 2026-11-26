@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Stand-in for uv: tools, managed Python downloads and a cache, laid out like the real thing.
+S="$STUB_STATE/uv"; PY="$HOME/.local/share/uv/python"
+case "${1:-} ${2:-}" in
+  "python dir") echo "$PY" ;;
+  "python uninstall") rm -rf "${PY:?}/$3" ;;
+  "tool list") for t in "$S"/tools/*; do [ -e "$t" ] || continue; echo "${t##*/} v1.0"; echo "- ${t##*/}"; done ;;
+  "tool install")
+    name="${*: -1}"; name="${name%%>=*}"
+    mkdir -p "$PY" "$HOME/.cache/uv" "$HOME/.local/share/uv/tools/$name" "$HOME/.local/bin"
+    found=0; for d in "$PY"/cpython-3.12*; do [ -e "$d" ] && found=1; done
+    [ "$found" = 1 ] || mkdir "$PY/cpython-3.12.9-stub"
+    echo cache >"$HOME/.cache/uv/$name.whl"
+    mkdir -p "$S/tools"; touch "$S/tools/$name"
+    printf '#!/bin/sh\necho stub %s\n' "$name" >"$HOME/.local/bin/$name"; chmod +x "$HOME/.local/bin/$name" ;;
+  "tool uninstall") rm -f "$S/tools/$3"; rm -rf "$HOME/.local/share/uv/tools/$3"; rm -f "$HOME/.local/bin/$3"
+                    rmdir "$S/tools" "$S" 2>/dev/null; true ;;
+  "tool upgrade") ;;
+esac

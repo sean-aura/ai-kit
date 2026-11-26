@@ -80,15 +80,15 @@ logrows() { python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).e
 logs_before="$(logrows)"
 $A incognito ask write hello >/dev/null 2>&1
 is   "incognito ignores memory"      "$(sysmsg)" ""
-is   "incognito leaves no folder"    "$(find "$T/data/incognito" -mindepth 1 | wc -l | tr -d ' ')" "0"
+is   "incognito leaves no folder"    "$(find "$T/data/incognito" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')" "0"
 is   "incognito not in local logs"   "$(logrows)" "$logs_before"
 if [ "$logs_before" -gt 0 ]; then ok "normal asks are logged ($logs_before turns)"; else bad "normal asks are logged" "$logs_before"; fi
 printf 'hi\nexit\n' | $A -i repl write >/dev/null 2>&1
-is   "incognito repl leaves nothing" "$(find "$T/data/incognito" -mindepth 1 | wc -l | tr -d ' ')" "0"
+is   "incognito repl leaves nothing" "$(find "$T/data/incognito" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')" "0"
 fails "incognito refuses to remember" $A -i remember "secret"
 mkdir -p "$T/data/incognito/999999"
 $A -i memory >/dev/null
-is   "stale incognito folder cleaned" "$(ls "$T/data/incognito")" ""
+is   "stale incognito folder cleaned" "$(ls "$T/data/incognito" 2>/dev/null)" ""
 $A forget 1 >/dev/null
 is   "forget one"                    "$($A memory | sed -n 2p)" "  1. Use NZ English"
 $A forget all >/dev/null
