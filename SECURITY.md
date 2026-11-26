@@ -20,6 +20,9 @@ Please use GitHub's **private vulnerability reporting** (Security tab, then "Rep
 | API keys in the macOS Keychain, or a mode-600 file on Linux; never in the repo | Environment variables of the same name override them, for CI or managed machines. |
 | Keys never appear in process arguments | curl reads headers from stdin. llm gets the key from a user-only file that exists only while the command runs. |
 | Data folder (`~/.local/share/ai-kit`) is mode 700 | Chats, uploads, logs and backups are readable by your user only. |
+| **Separate spaces for local and hybrid mode** (separate chat database, uploads, indexes, logs, memories) | Open WebUI puts stored memories into the prompt by default. With one shared store, something remembered in a local session could later be sent to a cloud model. Separate spaces make that impossible. |
+| Background memory review off (`ENABLE_MEMORY_BACKGROUND_REVIEW=False`); memories are only saved when the user asks | Nothing is remembered implicitly. |
+| Incognito: a throwaway space deleted on exit, memory disabled, stale sessions cleaned up on the next run | Leaves no history on disk. It uses a fresh data folder rather than Open WebUI's Temporary Chat, because Temporary Chat turns off document parsing. |
 | Models pinned by fingerprint (`ai lock` / `ai verify`) | Detects a model that was swapped or corrupted. |
 | Nothing updates automatically | A change never lands unreviewed. `ai update` backs up chat data first. |
 
@@ -43,7 +46,10 @@ Please use GitHub's **private vulnerability reporting** (Security tab, then "Rep
 | Models come from public registries | `models.lock` detects change but doesn't vet the source. |
 | Python dependencies of Open WebUI and llm aren't hash-pinned by ai-kit | Version floor only. `tools.lock` records what was approved. |
 | `ai wipe` is not a secure erase on SSDs | Relies on disk encryption (FileVault). `ai doctor` reports it. |
-| `ai ask` keeps a prompt history (llm's logs.db) | Stored in the user-only data folder. `ai log off` stops it, `ai wipe` deletes it. |
+| `ai ask` and `ai repl` keep a prompt history (llm's logs.db, per space) | Stored in the user-only data folder. `ai log off` stops it for `ai ask` (llm can't switch it off for `repl`), `ai wipe` deletes it, and incognito leaves none. |
+| Incognito is not a secure erase | Deleted files may be recoverable on SSDs. It relies on disk encryption, like `ai wipe`. The browser can keep page data unless you use a private window. A killed session leaves its folder until the next ai-kit command. |
+| Incognito doesn't cover cloud providers | Prompts sent to a cloud model in hybrid mode fall under that provider's retention terms. ai-kit warns each time. |
+| Hybrid space memories can reach cloud models | That's the point of the hybrid space. Keep anything that must stay local in local mode. |
 | A remote Ollama (`AI_OLLAMA_ADDR`) still counts as "local" | Prompts cross the network to that machine. Use only a server you control. `ai doctor` flags it. |
 | `ai code` with a local model | Not verified to make no outside connections. Don't use it for sensitive work. |
 | The one-line installer runs code from the network | Pin a release with `AIKIT_REF`, or clone and read `install.sh` first. |

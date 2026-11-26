@@ -74,6 +74,40 @@ ai mode local                # back to local only
 
 Hybrid mode never sends anything to the cloud on its own: the default for every role is still the local model. It does make it *possible* to pick a cloud model, so use local mode (or `AI_MODE=local` in the environment, which overrides the setting) for material that must not leave the machine. See [SECURITY.md](SECURITY.md).
 
+## Memory, spaces and incognito
+
+Local and hybrid mode each have their own **space**: chat history, uploaded documents, search indexes, prompt logs and memories. Nothing from the local space can be recalled in hybrid mode, so something remembered in a confidential local session can't end up in a prompt to a cloud model later.
+
+ai-kit **remembers only when told**. The chat window's automatic background memory is switched off.
+
+- **In the chat window**, ask the model to remember something (this needs a model with native tool calling), or add it yourself under Settings > Personalization. Those memories belong to that space's chat window.
+- **In the terminal**, memory is explicit:
+
+```bash
+ai remember "Client reports use NZ English and the 5x5 risk matrix"
+ai memory            # list what's remembered in the current space
+ai forget 2          # or: ai forget all
+ai ask --no-memory write "..."   # skip remembered context for one request
+```
+
+The terminal and the chat window keep separate memories, even within the same space.
+
+**Incognito** gives you a throwaway space: no memory is read or saved, and everything (history, uploads, indexes, logs) is deleted when the command ends.
+
+```bash
+ai incognito chat                 # chat window on port 8081; open it in a private browser window
+ai incognito ask write "..."      # or the short form: ai -i ask write "..."
+ai -i repl chat
+```
+
+Incognito covers this machine only. If you pick a cloud model, that provider's own data-retention rules still apply. `ai code` refuses incognito, because Claude Code keeps its own session history.
+
+| | local space | hybrid space | incognito |
+|---|---|---|---|
+| Chat history, uploads, logs | kept | kept (separately) | deleted on exit |
+| Memory | yes, when told | yes, when told (separately) | none |
+| Can reach cloud models | no | when chosen | only if the mode is hybrid |
+
 ## Commands
 
 | Command | What it does |
@@ -89,9 +123,11 @@ Hybrid mode never sends anything to the cloud on its own: the default for every 
 | `ai models` / `ai which <target>` / `ai models --remote <provider>` | What each role resolves to / one target / a provider's live model list |
 | `ai sync` / `ai prune` | Download the picks for this machine / delete unlisted models |
 | `ai mode` / `ai key` / `ai log` | Local or hybrid / API keys / terminal prompt history on or off |
+| `ai remember` / `ai memory` / `ai forget` | Terminal memory for the current space |
+| `ai incognito <command>` or `ai -i <command>` | Run chat, ask or repl with nothing saved and no memory |
 | `ai status` / `ai doctor` / `ai check` | What's running / full health check / validate the config files |
 | `ai stop` | Stop the chat window and the model server |
-| `ai backup` / `ai wipe` | Back up chats / delete chats, uploads, logs and backups |
+| `ai backup` / `ai wipe [local\|hybrid\|all]` | Back up both spaces / delete a space (or everything, including backups) |
 | `ai update` / `ai lock` / `ai verify` | Update everything / record approved versions / check against them |
 | `ai export` / `ai import` | Move models by USB to an offline machine |
 | `ai uninstall [--all]` | Remove ai-kit (`--all` also removes models, keys and settings) |
@@ -116,7 +152,9 @@ This repo ships the `security-reports` pack (gap analysis, risk assessment, envi
 |---|---|
 | Free RAM | `ai stop` |
 | Free disk | `ai prune` (unlisted models), or remove a role's row and prune |
-| Delete chat history, uploads and logs | `ai wipe` |
+| Delete one space's history, uploads, memories and logs | `ai wipe local` or `ai wipe hybrid` |
+| Delete both spaces and all backups | `ai wipe` |
+| Leave nothing behind in the first place | `ai incognito chat` |
 | Remove ai-kit but keep models and keys | `ai uninstall` |
 | Remove everything | `ai uninstall --all`, then the `brew uninstall` line it prints |
 
@@ -131,6 +169,8 @@ Everything is a line in a text file: add a provider (any OpenAI-compatible endpo
 - **Some Open WebUI settings are unconfirmed** for 0.13.x: `ENABLE_PLUGINS`, `ENABLE_TOOL_SERVERS` and `OPENAI_API_CONFIGS` (used to limit the cloud model list). A setting Open WebUI ignores fails silently. Check the chat window's admin pages on the pilot machine.
 - **Claude through Open WebUI and `ai ask` uses Anthropic's OpenAI-compatible endpoint**, which Anthropic describes as a way to test and compare models. Features such as prompt caching aren't available there. For heavier Claude use, `ai code --cloud` (Claude Code) talks to Anthropic natively.
 - **Local image generation** relies on Ollama's experimental, macOS-only support.
+- **"Remember this" in the chat window** needs a model with native tool calling, and it's unconfirmed whether ai-kit's `ENABLE_PLUGINS=False` also switches off Open WebUI's built-in memory tools. Adding memories by hand in Settings > Personalization works either way. Check on the pilot.
+- **Terminal and chat-window memories are separate stores.** They aren't synced, even within the same space.
 
 ## Licence
 

@@ -55,6 +55,40 @@ MODE="${AI_MODE:-$(cfg_get mode)}"
 MODE="${MODE:-$AI_MODE_DEFAULT}"
 case "$MODE" in local|hybrid) ;; *) die "unknown mode '$MODE' (use local or hybrid)" ;; esac
 
+# One exit handler; commands add clean-up steps instead of replacing each other's traps.
+CLEANUP=":"
+on_exit() { eval "$CLEANUP"; }
+add_cleanup() { CLEANUP="$CLEANUP; $1"; }
+trap on_exit EXIT
+
+# ---- spaces: chat history, uploads, logs and memory are kept per mode, so
+# nothing remembered in local mode can be recalled (and sent) in hybrid mode.
+# Incognito gets a throwaway space that is deleted when the command ends.
+INCOGNITO="${AI_INCOGNITO:-0}"
+SPACE=""
+space_init() {
+  if [ "$INCOGNITO" = 1 ]; then
+    local d
+    mkdir -p "$DATA/incognito"; chmod 700 "$DATA/incognito"
+    for d in "$DATA"/incognito/*; do   # remove leftovers from sessions that were killed
+      [ -d "$d" ] || continue
+      kill -0 "$(basename "$d")" 2>/dev/null || rm -rf "$d"
+    done
+    SPACE="$DATA/incognito/$$"
+    add_cleanup "rm -rf '$SPACE'"
+  else
+    SPACE="$DATA/spaces/$MODE"
+    # one-time move of pre-spaces data into the local space
+    if [ -d "$DATA/webui" ] && [ ! -d "$DATA/spaces/local/webui" ]; then
+      mkdir -p "$DATA/spaces/local"; mv "$DATA/webui" "$DATA/spaces/local/webui"
+      [ -f "$DATA/webui-secret" ] && mv "$DATA/webui-secret" "$DATA/spaces/local/webui-secret"
+      [ -d "$DATA/llm" ] && mv "$DATA/llm" "$DATA/spaces/local/llm"
+    fi
+  fi
+  mkdir -p "$SPACE"; chmod 700 "$SPACE"
+}
+space_name() { if [ "$INCOGNITO" = 1 ]; then echo "incognito"; else echo "$MODE"; fi; }
+
 ram_gb() {   # AI_RAM_GB overrides detection (e.g. to preview a 16GB colleague's picks)
   if [ -n "${AI_RAM_GB:-}" ]; then echo "$AI_RAM_GB"
   elif is_mac; then echo $(( $(sysctl -n hw.memsize) / 1073741824 ))
@@ -215,10 +249,21 @@ prompt_text() {   # a pack's _rules.md is prepended to every prompt in that pack
   cat "$f"
 }
 
+# ---- terminal memory: plain lines in the space's memory.md, added only when
+# you say so (ai remember), sent as context with ai ask / ai repl in that space.
+mem_file() { echo "$SPACE/memory.md"; }
+memory_text() {
+  [ "$INCOGNITO" = 1 ] && return 0
+  [ -s "$(mem_file)" ] || return 0
+  echo "Things the user has asked you to remember (use them when relevant):"
+  sed 's/^/- /' "$(mem_file)"
+  echo
+}
+
 # llm reads OpenAI-compatible models from this file. Regenerated on each use,
 # so models.conf and providers.conf stay the only things you edit.
 write_llm_config() {
-  local d="$DATA/llm" p m url
+  local d="$SPACE/llm" p m url
   mkdir -p "$d"
   { model_rows | awk -F'|' '{ print $2 "|" $3 }'; echo "$1|$2"; } | sort -u |
   while IFS='|' read -r p m; do
@@ -242,13 +287,14 @@ cmd_which() {   # ai which [--cloud] TARGET
 # ask / repl share option parsing
 llm_run() {   # llm_run prompt|chat ARGS...
   local sub="$1"; shift
-  local want=local prompt="" pm p m
+  local want=local prompt="" pm p m usemem=1 sys=""
   local extra=()
   while [ $# -gt 0 ]; do
     case "$1" in
       -c|--cloud)  want=cloud ;;
       -p|--prompt) [ $# -ge 2 ] || die "$1 needs a prompt name"; prompt="$2"; shift ;;
       -f|--file)   [ $# -ge 2 ] || die "$1 needs a file"; [ -f "$2" ] || die "no such file: $2"; extra+=(-f "$2"); shift ;;
+      --no-memory) usemem=0 ;;
       --)          shift; break ;;
       -*)          die "unknown option $1 (see: ai help)" ;;
       *)           break ;;
@@ -261,21 +307,25 @@ llm_run() {   # llm_run prompt|chat ARGS...
   prepare "$p"            # mode and key checks come first
   have llm || die "llm not found. Re-run install.sh"
   write_llm_config "$p" "$m"
-  [ -n "$prompt" ] && extra+=(-s "$(prompt_text "$prompt")")
-  [ "$(cfg_get log)" = off ] && [ "$sub" = prompt ] && extra+=(-n)
+  [ "$usemem" = 1 ] && sys="$(memory_text)"
+  [ -n "$prompt" ] && sys="$sys$(prompt_text "$prompt")"
+  [ -n "$sys" ] && extra+=(-s "$sys")
+  # Incognito: the whole space is deleted on exit; -n also skips the log for ask.
+  if [ "$sub" = prompt ] && { [ "$(cfg_get log)" = off ] || [ "$INCOGNITO" = 1 ]; }; then extra+=(-n); fi
   if [ "$sub" = prompt ] && [ $# -eq 0 ] && [ -t 0 ]; then
     die "nothing to send. Give text after the model, or pipe it in: cat notes.md | ai ask write -p rewrite"
   fi
-  [ "$(prov_kind "$p")" = cloud ] && warn "cloud: this goes to $p."
+  if [ "$(prov_kind "$p")" = cloud ]; then
+    warn "cloud: this goes to $p.$([ "$INCOGNITO" = 1 ] && echo " Incognito only covers this machine; $p's own retention rules still apply.")"
+  fi
   # llm ignores environment variables for custom endpoints and --key would show
   # the key in `ps`, so hand it over in a user-only keys file removed on exit.
   # printf is a shell built-in, so the key never appears in any process's arguments.
-  local kf="$DATA/llm/keys.json"
-  # shellcheck disable=SC2064  # expand now: $kf is out of scope when the trap runs
-  trap "rm -f '$kf'" EXIT
+  local kf="$SPACE/llm/keys.json"
+  add_cleanup "rm -f '$kf'"
   ( umask 077
     printf '{"ai-kit-%s": "%s"}\n' "$p" "$(printf '%s' "$KEY" | sed 's/\\/\\\\/g; s/"/\\"/g')" >"$kf" )
-  LLM_USER_PATH="$DATA/llm" llm "$sub" -m "$p/$m" ${extra[@]+"${extra[@]}"} "$@"
+  LLM_USER_PATH="$SPACE/llm" llm "$sub" -m "$p/$m" ${extra[@]+"${extra[@]}"} "$@"
 }
 cmd_ask()  { llm_run prompt "$@"; }
 cmd_repl() { llm_run chat "$@"; }
@@ -293,11 +343,11 @@ cmd_chat() {   # web UI: ai chat [role|model]
     die "'$target' is a cloud model and this machine is in local mode. To allow: ai mode hybrid"
   fi
   start_server
-  trap 'stop_server' EXIT
+  add_cleanup stop_server
   trap 'exit 130' INT TERM
 
   # A stable secret, kept with the data instead of in the current directory.
-  secret="$DATA/webui-secret"
+  secret="$SPACE/webui-secret"
   if [ ! -s "$secret" ]; then
     (umask 077; { openssl rand -hex 32 2>/dev/null || od -An -N32 -tx1 /dev/urandom | tr -d ' \n'; } >"$secret")
   fi
@@ -327,13 +377,14 @@ cmd_chat() {   # web UI: ai chat [role|model]
   embed="$(pick embed local | cut -d'|' -f2)"
   # Settings come from here, not the UI, so everyone runs the same configuration.
   export OLLAMA_BASE_URL="$OLLAMA_URL" DEFAULT_MODELS="$model" \
-    DATA_DIR="$DATA/webui" WEBUI_SECRET_KEY="$skey" \
+    DATA_DIR="$SPACE/webui" WEBUI_SECRET_KEY="$skey" \
     WEBUI_AUTH=False ENABLE_PERSISTENT_CONFIG=False \
     OFFLINE_MODE=true HF_HUB_OFFLINE=1 ENABLE_VERSION_UPDATE_CHECK=false \
     ANONYMIZED_TELEMETRY=False DO_NOT_TRACK=True SCARF_NO_ANALYTICS=True \
     ENABLE_COMMUNITY_SHARING=False ENABLE_CODE_EXECUTION=False ENABLE_CODE_INTERPRETER=False \
     ENABLE_WEB_SEARCH=False ENABLE_IMAGE_GENERATION=False ENABLE_VIDEO_GENERATION=False \
     ENABLE_TOOL_SERVERS=False ENABLE_PLUGINS=False ENABLE_TOOL_PERMISSIONS=True \
+    ENABLE_MEMORY_BACKGROUND_REVIEW=False \
     RAG_EMBEDDING_ENGINE=ollama RAG_EMBEDDING_MODEL="$embed"
   if [ -n "$urls" ]; then
     export ENABLE_OPENAI_API=True OPENAI_API_BASE_URLS="$urls" OPENAI_API_KEYS="$keys" OPENAI_API_CONFIGS="$cfgs"
@@ -342,10 +393,23 @@ cmd_chat() {   # web UI: ai chat [role|model]
   fi
   [ "$MODE" = hybrid ] && warn "hybrid mode: cloud models in the picker send your prompts and files to that provider."
 
-  mkdir -p "$DATA/webui"; cd "$DATA"
-  say "Starting chat ($MODE mode, default model $model) at http://127.0.0.1:$OPEN_WEBUI_PORT  (Ctrl-C to stop)"
-  ( sleep 6; open_url "http://127.0.0.1:$OPEN_WEBUI_PORT" ) &
-  open-webui serve --host 127.0.0.1 --port "$OPEN_WEBUI_PORT"
+  local port="$OPEN_WEBUI_PORT"
+  if [ "$INCOGNITO" = 1 ]; then
+    # No memory at all, and a separate port so a normal chat can run alongside.
+    export ENABLE_MEMORIES=False
+    port=$((OPEN_WEBUI_PORT + 1))
+  else
+    export ENABLE_MEMORIES=True
+  fi
+  mkdir -p "$SPACE/webui"; cd "$SPACE"
+  say "Starting chat ($(space_name) space, default model $model) at http://127.0.0.1:$port  (Ctrl-C to stop)"
+  if [ "$INCOGNITO" = 1 ]; then
+    say "Incognito: history, uploads and indexes are deleted when you press Ctrl-C."
+    say "Open the address in a PRIVATE browser window, so the browser keeps nothing either."
+  else
+    ( sleep 6; open_url "http://127.0.0.1:$port" ) &
+  fi
+  open-webui serve --host 127.0.0.1 --port "$port"
 }
 
 cmd_pick() {
@@ -397,6 +461,7 @@ cmd_image() {   # ai image [--cloud] [-o dir] "description"
 }
 
 cmd_code() {   # ai code [--cloud] [role|model] [-- claude args]
+  [ "$INCOGNITO" = 1 ] && die "incognito can't cover Claude Code: it keeps its own session history in ~/.claude"
   have claude || die "Claude Code is not installed (uncomment it in Brewfile and re-run install.sh)"
   local want=local target=code pm m
   case "${1:-}" in -c|--cloud) want=cloud; shift ;; esac
@@ -569,9 +634,37 @@ cmd_key() {   # ai key [list] | set PROVIDER | rm PROVIDER
 
 cmd_log() {   # ai log [on|off]  - terminal prompt history (llm's database)
   case "${1:-}" in
-    "")     say "Prompt logging for ai ask: $( [ "$(cfg_get log)" = off ] && echo off || echo on ) ($DATA/llm)" ;;
+    "")     say "Prompt logging for ai ask: $( [ "$(cfg_get log)" = off ] && echo off || echo on ) ($SPACE/llm)" ;;
     on|off) cfg_set log "$1"; say "Prompt logging $1." ;;
     *)      die "usage: ai log [on|off]" ;;
+  esac
+}
+
+# ------------------------------------------------------------ memory
+cmd_remember() {   # ai remember "fact"
+  [ "$INCOGNITO" = 1 ] && die "incognito sessions don't remember anything"
+  [ $# -gt 0 ] || die "usage: ai remember \"something to keep in mind\""
+  ( umask 077; printf '%s\n' "$*" | tr '\n' ' ' | sed 's/ *$//' >>"$(mem_file)"; echo >>"$(mem_file)" )
+  say "Remembered in the $(space_name) space (#$(wc -l <"$(mem_file)" | tr -d ' ')). Used by ai ask and ai repl in $(space_name) mode."
+}
+cmd_memory() {   # ai memory - list what the terminal remembers in this space
+  if [ "$INCOGNITO" = 1 ] || [ ! -s "$(mem_file)" ]; then
+    say "Nothing remembered in the $(space_name) space."
+  else
+    say "Remembered in the $(space_name) space (forget with: ai forget <number>|all):"
+    awk '{ printf "  %d. %s\n", NR, $0 }' "$(mem_file)"
+  fi
+  [ "$INCOGNITO" = 1 ] || say "The chat window keeps its own memories for this space: Settings > Personalization."
+}
+cmd_forget() {   # ai forget N | all
+  local f; f="$(mem_file)"
+  [ -s "$f" ] || { say "Nothing to forget."; return 0; }
+  case "${1:-}" in
+    all) rm -f "$f"; say "Forgot everything in the $(space_name) space." ;;
+    ''|*[!0-9]*) die "usage: ai forget <number>|all  (see: ai memory)" ;;
+    *) [ "$1" -ge 1 ] && [ "$1" -le "$(wc -l <"$f")" ] || die "no memory #$1 (see: ai memory)"
+       ( umask 077; awk -v n="$1" 'NR != n' "$f" >"$f.tmp" ); mv "$f.tmp" "$f"
+       say "Forgot #$1." ;;
   esac
 }
 
@@ -599,6 +692,14 @@ cmd_status() {
   else say "Ollama  stopped"; fi
   if pgrep -f "open-webui serve" >/dev/null 2>&1; then say "Chat    running at http://127.0.0.1:$OPEN_WEBUI_PORT"; else say "Chat    stopped"; fi
   say "Disk    models $(du -sh "$HOME/.ollama/models" 2>/dev/null | cut -f1 || echo 0)   data $(du -sh "$DATA" 2>/dev/null | cut -f1)"
+  local sp n
+  for sp in local hybrid; do
+    [ -d "$DATA/spaces/$sp" ] || continue
+    n=0; [ -s "$DATA/spaces/$sp/memory.md" ] && n="$(wc -l <"$DATA/spaces/$sp/memory.md" | tr -d ' ')"
+    say "Space   $sp: $(du -sh "$DATA/spaces/$sp" 2>/dev/null | cut -f1), $n terminal memories"
+  done
+  n="$(find "$DATA/incognito" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$n" = 0 ] || say "Space   incognito: $n session(s) open"
 }
 
 cmd_doctor() {
@@ -641,19 +742,26 @@ cmd_doctor() {
 }
 
 # ------------------------------------------------------------ data lifecycle
-cmd_backup() {
-  [ -d "$DATA/webui" ] || { say "No chat data to back up."; return 0; }
+cmd_backup() {   # backs up every space (chats, uploads, terminal memory and logs)
+  [ -d "$DATA/spaces" ] || { say "No chat data to back up."; return 0; }
   mkdir -p "$DATA/backups"
-  local f; f="$DATA/backups/webui-$(date +%Y%m%d-%H%M%S).tgz"
-  ( umask 077; tar -czf "$f" -C "$DATA" webui )
+  local f; f="$DATA/backups/spaces-$(date +%Y%m%d-%H%M%S).tgz"
+  ( umask 077; tar -czf "$f" -C "$DATA" spaces )
   say "Wrote $f"
 }
 
-cmd_wipe() {
-  say "This permanently deletes chat history, uploads, search indexes, prompt logs and backups in $DATA."
+cmd_wipe() {   # ai wipe [local|hybrid|all]
+  local which="${1:-all}"
+  case "$which" in local|hybrid|all) ;; *) die "usage: ai wipe [local|hybrid|all]" ;; esac
+  if [ "$which" = all ]; then
+    say "This permanently deletes chat history, uploads, indexes, memories, prompt logs and backups for BOTH spaces."
+  else
+    say "This permanently deletes chat history, uploads, indexes, memories and prompt logs in the $which space. (Backups are kept; 'ai wipe all' removes them.)"
+  fi
   confirm "Type WIPE to continue:" WIPE || { say "Cancelled."; return 1; }
   stop_webui; stop_server
-  rm -rf "$DATA/webui" "$DATA/llm" "$DATA/backups" "$DATA/webui-secret"
+  if [ "$which" = all ]; then rm -rf "$DATA/spaces" "$DATA/backups" "$DATA/incognito"
+  else rm -rf "$DATA/spaces/$which"; fi
   say "Done. (On SSDs this is not a secure erase; disk encryption is the control.)"
 }
 
@@ -733,7 +841,7 @@ cmd_uninstall() {   # ai uninstall [--all]
 
 # ------------------------------------------------------------ help & dispatch
 usage() { cat <<EOF
-ai - local and cloud models from one command  (mode: $MODE)
+ai - local and cloud models from one command  (mode: $MODE, space: $(space_name))
 
 Use
   ai                          pick a role, open the chat window
@@ -741,10 +849,16 @@ Use
   ai ask  [opts] <target> [text]   one-shot answer in the terminal (reads stdin too)
   ai repl [opts] <target>     interactive chat in the terminal
       opts: -c/--cloud  use the role's cloud model     -p <prompt>  add a saved prompt
-            -f <file>   attach a text file (repeatable)
+            -f <file>   attach a text file (repeatable)  --no-memory  skip remembered context
   ai image [-c] [-o dir] "description"    generate an image
   ai code [-c] [role|model] [-- args]     coding agent (Claude Code), local or cloud
   ai which [-c] <target>      show which provider/model a target resolves to
+
+Memory and privacy  (local and hybrid mode each have their own space)
+  ai remember "text"          the terminal remembers this in the current space
+  ai memory | ai forget N|all list / remove what it remembers
+  ai incognito <command>      e.g. ai incognito chat: nothing saved, no memory used
+                              (also: ai -i ask ...). Cloud providers' own retention still applies.
 
   target = a role (chat, write, code, vision, image), provider/model, or an Ollama tag
 
@@ -767,7 +881,7 @@ Run and maintain
   ai status | ai doctor       what is running / full health check
   ai check                    validate providers.conf and models.conf
   ai stop                     stop the chat window and the model server
-  ai backup | ai wipe         back up / delete chats, uploads, logs
+  ai backup | ai wipe [space] back up / delete chats, uploads, memories, logs
   ai update                   update kit, tools and models (needs internet)
   ai lock | ai verify         record / check approved model and tool versions
   ai export | ai import f     move models without internet
@@ -776,6 +890,8 @@ EOF
 }
 
 main() {
+  case "${1:-}" in -i|--incognito|incognito) INCOGNITO=1; shift ;; esac
+  space_init
   local cmd="${1:-pick}"
   [ $# -gt 0 ] && shift
   case "$cmd" in
@@ -796,12 +912,15 @@ main() {
     mode)       cmd_mode "$@" ;;
     key|keys)   cmd_key "$@" ;;
     log)        cmd_log "$@" ;;
+    remember)   cmd_remember "$@" ;;
+    memory|memories) cmd_memory ;;
+    forget)     cmd_forget "$@" ;;
     status)     cmd_status ;;
     doctor)     cmd_doctor ;;
     check)      check_config ;;
     stop)       stop_webui; stop_server; say "Stopped." ;;
     backup)     cmd_backup ;;
-    wipe)       cmd_wipe ;;
+    wipe)       cmd_wipe "$@" ;;
     update)     cmd_update ;;
     lock)       cmd_lock ;;
     verify)     cmd_verify ;;

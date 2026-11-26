@@ -13,6 +13,10 @@ Reworked from the offline-only "local-ai-kit" into a local-first kit that can al
 - One-line installer (`curl ... | bash`) with release pinning, `AIKIT_SYNC` and `AIKIT_SKIP_DEPS`.
 - Prompt packs; the security-report prompts moved to `packs/security-reports`. Generic core prompts added.
 - Per-user overrides in `~/.config/ai-kit/` for models, providers, prompts and packs.
+- Separate spaces for local and hybrid mode (chat history, uploads, indexes, logs, memories), so local-session memories can't reach cloud models.
+- Explicit memory: `ai remember`, `ai memory`, `ai forget`. The chat window's background memory review is forced off.
+- Incognito mode (`ai incognito <command>` / `ai -i`): a throwaway space deleted on exit, with no memory.
+- `ai wipe [local|hybrid|all]`.
 - Linux support (best-effort, via Homebrew on Linux). `AI_OLLAMA_ADDR` for a shared GPU server.
 - MIT licence, SECURITY.md, CI (shellcheck and offline tests).
 

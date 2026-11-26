@@ -51,9 +51,51 @@ echo "notes" | $A ask -p security-reports/exec-summary write >/dev/null 2>&1
 is   "cloud key delivered exactly"   "$(jq -r 'select(.model=="model-cloud") | .auth' "$T/req.log" | head -n 1)" 'Bearer k"ey\x'
 has  "pack rules sent as system"     "$(jq -rs 'map(select(.messages)) | last | .messages[0].content' "$T/req.log")" "Working rules"
 is   "stdin sent as user message"    "$(jq -rs 'map(select(.messages)) | last | .messages[-1].content' "$T/req.log" | tr -d '\n')" "notes"
-is   "no keys file left behind"      "$(ls "$T/data/llm")" "$(printf 'extra-openai-models.yaml\nlogs.db')"
+is   "no keys file left behind"      "$(ls "$T/data/spaces/hybrid/llm")" "$(printf 'extra-openai-models.yaml\nlogs.db')"
 is   "remote model list"             "$(FAKE_API_KEY=x $A models --remote fakecloud | tr '\n' ' ')" "fake-model-a fake-model-b "
 has  "data dir is private"           "$(ls -ld "$T/data")" "drwx------"
+rm "$T/cfg/providers.conf" "$T/cfg/models.conf"
+
+
+# --- spaces, memory and incognito
+mkdir -p "$T/cfg"
+printf 'fakelocal|local|http://127.0.0.1:%s/v1|\n' "$PORT" >"$T/cfg/providers.conf"
+printf 'write|fakelocal|model-local|8|\n' >"$T/cfg/models.conf"
+sysmsg() { jq -rs 'map(select(.messages)) | last | .messages | map(select(.role == "system")) | .[0].content // ""' "$T/req.log"; }
+$A mode local >/dev/null
+$A remember "Client name is Kowhai Ltd" >/dev/null
+$A remember "Use NZ English" >/dev/null
+has  "memory listed in local space"  "$($A memory)" "2. Use NZ English"
+$A ask write hello >/dev/null 2>&1
+has  "memory sent as context (local)" "$(sysmsg)" "Kowhai Ltd"
+$A ask --no-memory write hello >/dev/null 2>&1
+is   "--no-memory skips it"          "$(sysmsg)" ""
+$A mode hybrid >/dev/null
+has  "hybrid space can't see it"     "$($A memory)" "Nothing remembered in the hybrid space"
+$A ask write hello >/dev/null 2>&1
+is   "hybrid ask gets no local memory" "$(sysmsg)" ""
+$A mode local >/dev/null
+# llm 0.38+ records each exchange in the "turns" table
+logrows() { python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("select count(*) from turns").fetchone()[0])' "$T/data/spaces/local/llm/logs.db"; }
+logs_before="$(logrows)"
+$A incognito ask write hello >/dev/null 2>&1
+is   "incognito ignores memory"      "$(sysmsg)" ""
+is   "incognito leaves no folder"    "$(find "$T/data/incognito" -mindepth 1 | wc -l | tr -d ' ')" "0"
+is   "incognito not in local logs"   "$(logrows)" "$logs_before"
+if [ "$logs_before" -gt 0 ]; then ok "normal asks are logged ($logs_before turns)"; else bad "normal asks are logged" "$logs_before"; fi
+printf 'hi\nexit\n' | $A -i repl write >/dev/null 2>&1
+is   "incognito repl leaves nothing" "$(find "$T/data/incognito" -mindepth 1 | wc -l | tr -d ' ')" "0"
+fails "incognito refuses to remember" $A -i remember "secret"
+mkdir -p "$T/data/incognito/999999"
+$A -i memory >/dev/null
+is   "stale incognito folder cleaned" "$(ls "$T/data/incognito")" ""
+$A forget 1 >/dev/null
+is   "forget one"                    "$($A memory | sed -n 2p)" "  1. Use NZ English"
+$A forget all >/dev/null
+has  "forget all"                    "$($A memory)" "Nothing remembered"
+$A mode hybrid >/dev/null; $A remember "hybrid note" >/dev/null; $A mode local >/dev/null
+AIKIT_YES=1 $A wipe local >/dev/null
+is   "wipe local keeps hybrid"       "$(ls "$T/data/spaces")" "hybrid"
 rm "$T/cfg/providers.conf" "$T/cfg/models.conf"
 
 # --- prompts
