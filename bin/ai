@@ -1,0 +1,816 @@
+#!/usr/bin/env bash
+# ai - one command for local and cloud models. Run `ai help`.
+# Part of ai-kit (MIT). Written for macOS's default bash 3.2:
+# no associative arrays, mapfile or ${x,,}.
+set -euo pipefail
+
+# ---------------------------------------------------------------- locate kit
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$dir/$SELF" ;; esac
+done
+KIT="$(cd "$(dirname "$SELF")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$KIT/kit.conf"
+
+CFG_DIR="${AIKIT_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ai-kit}"
+CFG_FILE="$CFG_DIR/config"
+KEYS_FILE="$CFG_DIR/keys.env"
+DATA="${AI_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/ai-kit}"
+CTX="${AI_CTX:-$AI_CTX_DEFAULT}"
+# AI_OLLAMA_ADDR points the kit at an Ollama server elsewhere (e.g. a team GPU
+# box on the LAN). Only use a machine you control: prompts go over the network.
+OLLAMA_ADDR="${AI_OLLAMA_ADDR:-$OLLAMA_ADDR}"
+OLLAMA_URL="http://$OLLAMA_ADDR"
+KEYCHAIN_SERVICE="ai-kit"
+OS="$(uname -s)"
+mkdir -p "$DATA" && chmod 700 "$DATA"
+
+# ------------------------------------------------------------------- helpers
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+is_mac() { [ "$OS" = Darwin ]; }
+
+# Ask on the terminal even when stdin is a pipe. confirm "question" "ANSWER"
+confirm() {   # AIKIT_YES=1 answers yes, for scripted use
+  [ "${AIKIT_YES:-0}" = 1 ] && return 0
+  local a=""
+  { printf '%s ' "$1" >/dev/tty; } 2>/dev/null || { warn "no terminal to confirm on (set AIKIT_YES=1 to proceed)"; return 1; }
+  { read -r a </dev/tty; } 2>/dev/null || true
+  [ "$a" = "$2" ]
+}
+
+cfg_get() { if [ -f "$CFG_FILE" ]; then sed -n "s/^$1=//p" "$CFG_FILE" | tail -n 1; fi; }
+cfg_set() {
+  mkdir -p "$CFG_DIR"; touch "$CFG_FILE"
+  { grep -v "^$1=" "$CFG_FILE" || true; printf '%s=%s\n' "$1" "$2"; } >"$CFG_FILE.tmp"
+  mv "$CFG_FILE.tmp" "$CFG_FILE"
+}
+
+MODE="${AI_MODE:-$(cfg_get mode)}"
+MODE="${MODE:-$AI_MODE_DEFAULT}"
+case "$MODE" in local|hybrid) ;; *) die "unknown mode '$MODE' (use local or hybrid)" ;; esac
+
+ram_gb() {   # AI_RAM_GB overrides detection (e.g. to preview a 16GB colleague's picks)
+  if [ -n "${AI_RAM_GB:-}" ]; then echo "$AI_RAM_GB"
+  elif is_mac; then echo $(( $(sysctl -n hw.memsize) / 1073741824 ))
+  else awk '/^MemTotal/ { printf "%d\n", $2 / 1048576 + 0.99 }' /proc/meminfo; fi
+}
+clip() {
+  if have pbcopy; then pbcopy
+  elif have wl-copy; then wl-copy
+  elif have xclip; then xclip -selection clipboard
+  else return 1; fi
+}
+open_url() {
+  if is_mac; then open "$1"
+  elif have xdg-open; then xdg-open "$1" >/dev/null 2>&1 || true
+  else say "Open $1 in your browser"; fi
+}
+version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n 1)" = "$2" ]; }   # $1 >= $2 ?
+
+# ----------------------------------------------------------- config parsing
+# Strip comments and blank lines. User files come first so they win.
+rows() {
+  local f
+  for f in "$@"; do
+    [ -f "$f" ] && sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$f"
+  done
+  return 0
+}
+provider_rows() { rows "$CFG_DIR/providers.conf" "$KIT/providers.conf"; }
+model_rows()    { rows "$CFG_DIR/models.conf" "$KIT/models.conf"; }
+
+prov_get() { provider_rows | awk -F'|' -v n="$1" -v f="$2" '$1 == n && !d { print $f; d = 1 }'; }
+prov_kind()   { prov_get "$1" 2; }
+prov_url()    { if [ "$1" = ollama ]; then echo "$OLLAMA_URL/v1"; else prov_get "$1" 3; fi; }
+prov_keyvar() { prov_get "$1" 4; }
+is_provider() { [ -n "$(prov_kind "$1")" ]; }
+is_role()     { model_rows | awk -F'|' -v t="$1" '$1 == t { f = 1 } END { exit !f }'; }
+roles()       { model_rows | awk -F'|' '!s[$1]++ { print $1 }'; }
+kinds()       { provider_rows | awk -F'|' '{ printf "%s=%s ", $1, $2 }'; }
+
+# pick ROLE local|cloud -> "provider|model|note" or nothing
+pick() {
+  model_rows | awk -F'|' -v t="$1" -v want="$2" -v ram="$(ram_gb)" -v kinds="$(kinds)" '
+    BEGIN { n = split(kinds, a, " "); for (i = 1; i <= n; i++) { split(a[i], kv, "="); if (!(kv[1] in K)) K[kv[1]] = kv[2] } }
+    !d && $1 == t && K[$2] == want && (want != "local" || $4 + 0 <= ram + 0) { print $2 "|" $3 "|" $5; d = 1 }'
+}
+
+# resolve TARGET local|cloud -> "provider|model"
+resolve() {
+  local t="$1" want="$2" p r
+  case "$t" in
+    */*) p="${t%%/*}"
+         if is_provider "$p"; then echo "$p|${t#*/}"; return 0; fi ;;
+  esac
+  if is_role "$t"; then
+    r="$(pick "$t" "$want")"
+    [ -n "$r" ] && { echo "${r%|*}"; return 0; }
+    if [ "$want" = local ]; then die "no local model for '$t' fits this machine ($(ram_gb)GB). Try: ai ask --cloud $t"
+    else die "no cloud model configured for '$t' in models.conf"; fi
+  fi
+  [ "$want" = cloud ] && die "'$t' is not a role. For a specific cloud model use provider/model, e.g. anthropic/claude-opus-5-5"
+  echo "ollama|$t"   # anything else is treated as an Ollama tag
+}
+
+norm() { case "$1" in *:*) echo "$1" ;; *) echo "$1:latest" ;; esac; }
+
+# ------------------------------------------------------------------- keys
+key_get() {
+  local v="$1" val=""
+  [ -n "$v" ] || return 0
+  val="$(printenv "$v" || true)"
+  if [ -z "$val" ] && is_mac; then
+    val="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$v" -w 2>/dev/null || true)"
+  fi
+  if [ -z "$val" ] && [ -f "$KEYS_FILE" ]; then val="$(sed -n "s/^$v=//p" "$KEYS_FILE" | tail -n 1)"; fi
+  printf '%s' "$val"
+}
+
+# prepare PROVIDER: sets URL and KEY, enforces the mode, starts Ollama if needed.
+URL=""; KEY=""
+prepare() {
+  local p="$1" kind
+  kind="$(prov_kind "$p")"
+  [ -n "$kind" ] || die "unknown provider '$p' (see providers.conf)"
+  URL="$(prov_url "$p")"
+  if [ "$kind" = cloud ]; then
+    [ "$MODE" = hybrid ] || die "'$p' is a cloud provider and this machine is in local mode. To allow cloud use: ai mode hybrid"
+    KEY="$(key_get "$(prov_keyvar "$p")")"
+    [ -n "$KEY" ] || die "no API key for $p. Run: ai key set $p"
+  else
+    KEY="local"
+    if [ "$p" = ollama ]; then start_server; fi
+  fi
+}
+
+# Send headers through curl's config on stdin so keys never appear in `ps`.
+auth_curl() {   # auth_curl PROVIDER curl-args...
+  local p="$1"; shift
+  {
+    printf 'header = "Authorization: Bearer %s"\n' "$KEY"
+    if [ "$p" = anthropic ]; then
+      printf 'header = "x-api-key: %s"\n' "$KEY"
+      printf 'header = "anthropic-version: 2023-06-01"\n'
+    fi
+  } | curl -sS -K - "$@"
+}
+
+# ----------------------------------------------------------------- servers
+server_up() { curl -fs --max-time 2 "$OLLAMA_URL/api/version" >/dev/null 2>&1; }
+
+start_server() {
+  server_up && return 0
+  case "$OLLAMA_ADDR" in 127.0.0.1:*|localhost:*) ;; *) die "Ollama at $OLLAMA_ADDR is not reachable (AI_OLLAMA_ADDR)";; esac
+  have ollama || die "ollama not found. Re-run install.sh"
+  # Ollama's own cloud models and web search are always off: cloud use goes
+  # through providers.conf, where the mode can gate it.
+  OLLAMA_NO_CLOUD=1 OLLAMA_HOST="$OLLAMA_ADDR" OLLAMA_CONTEXT_LENGTH="$CTX" \
+  OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-10m}" \
+    nohup ollama serve >"$DATA/ollama.log" 2>&1 &
+  echo $! >"$DATA/ollama.pid"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do server_up && return 0; sleep 1; done
+  die "Ollama did not start (waited ${i}s). See $DATA/ollama.log"
+}
+
+stop_server() {
+  if [ -f "$DATA/ollama.pid" ]; then
+    kill "$(cat "$DATA/ollama.pid")" 2>/dev/null || true
+    rm -f "$DATA/ollama.pid"
+  elif server_up; then
+    say "Ollama is running but was not started by ai-kit; leaving it alone."
+  fi
+}
+stop_webui() { pkill -f "open-webui serve" 2>/dev/null || true; }
+
+webui_version() { uv tool list 2>/dev/null | awk '$1 == "open-webui" { sub(/^v/, "", $2); print $2 }' || true; }
+
+installed_models() { if server_up; then ollama list 2>/dev/null | awk 'NR > 1 { print $1 }'; fi; }
+is_installed() { installed_models | grep -qxF "$(norm "$1")"; }
+
+# --------------------------------------------------------------- prompts
+prompt_file() {   # name or pack/name -> path
+  local n="$1" d
+  case "$n" in
+    */*) for d in "$CFG_DIR/packs" "$KIT/packs"; do
+           [ -f "$d/${n%%/*}/prompts/${n#*/}.md" ] && { echo "$d/${n%%/*}/prompts/${n#*/}.md"; return 0; }
+         done ;;
+    *)   for d in "$CFG_DIR/prompts" "$KIT/prompts" "$CFG_DIR"/packs/*/prompts "$KIT"/packs/*/prompts; do
+           [ -f "$d/$n.md" ] && { echo "$d/$n.md"; return 0; }
+         done ;;
+  esac
+  return 1
+}
+prompt_text() {   # a pack's _rules.md is prepended to every prompt in that pack
+  local f d
+  f="$(prompt_file "$1")" || die "no prompt '$1'. List them with: ai prompt"
+  d="$(dirname "$f")"
+  [ -f "$d/_rules.md" ] && { cat "$d/_rules.md"; echo; }
+  cat "$f"
+}
+
+# llm reads OpenAI-compatible models from this file. Regenerated on each use,
+# so models.conf and providers.conf stay the only things you edit.
+write_llm_config() {
+  local d="$DATA/llm" p m url
+  mkdir -p "$d"
+  { model_rows | awk -F'|' '{ print $2 "|" $3 }'; echo "$1|$2"; } | sort -u |
+  while IFS='|' read -r p m; do
+    url="$(prov_url "$p")"
+    [ -n "$url" ] || continue
+    # api_key_name makes llm use the --key we pass (without it llm sends a dummy key).
+    printf -- '- model_id: "%s/%s"\n  model_name: "%s"\n  api_base: "%s"\n  api_key_name: "ai-kit-%s"\n' "$p" "$m" "$m" "$url" "$p"
+  done >"$d/extra-openai-models.yaml"
+}
+
+# ============================================================== commands
+
+cmd_which() {   # ai which [--cloud] TARGET
+  local want=local
+  case "${1:-}" in -c|--cloud) want=cloud; shift ;; esac
+  [ -n "${1:-}" ] || die "usage: ai which [--cloud] <role|provider/model|tag>"
+  local pm; pm="$(resolve "$1" "$want")"
+  say "${pm%%|*}/${pm#*|}  ($(prov_kind "${pm%%|*}"))"
+}
+
+# ask / repl share option parsing
+llm_run() {   # llm_run prompt|chat ARGS...
+  local sub="$1"; shift
+  local want=local prompt="" pm p m
+  local extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c|--cloud)  want=cloud ;;
+      -p|--prompt) [ $# -ge 2 ] || die "$1 needs a prompt name"; prompt="$2"; shift ;;
+      -f|--file)   [ $# -ge 2 ] || die "$1 needs a file"; [ -f "$2" ] || die "no such file: $2"; extra+=(-f "$2"); shift ;;
+      --)          shift; break ;;
+      -*)          die "unknown option $1 (see: ai help)" ;;
+      *)           break ;;
+    esac
+    shift
+  done
+  [ $# -gt 0 ] || die "usage: ai $([ "$sub" = prompt ] && echo ask || echo repl) [--cloud] [-p prompt] [-f file] <role|provider/model|tag> [text]"
+  pm="$(resolve "$1" "$want")"; shift
+  p="${pm%%|*}"; m="${pm#*|}"
+  prepare "$p"            # mode and key checks come first
+  have llm || die "llm not found. Re-run install.sh"
+  write_llm_config "$p" "$m"
+  [ -n "$prompt" ] && extra+=(-s "$(prompt_text "$prompt")")
+  [ "$(cfg_get log)" = off ] && [ "$sub" = prompt ] && extra+=(-n)
+  if [ "$sub" = prompt ] && [ $# -eq 0 ] && [ -t 0 ]; then
+    die "nothing to send. Give text after the model, or pipe it in: cat notes.md | ai ask write -p rewrite"
+  fi
+  [ "$(prov_kind "$p")" = cloud ] && warn "cloud: this goes to $p."
+  # llm ignores environment variables for custom endpoints and --key would show
+  # the key in `ps`, so hand it over in a user-only keys file removed on exit.
+  # printf is a shell built-in, so the key never appears in any process's arguments.
+  local kf="$DATA/llm/keys.json"
+  # shellcheck disable=SC2064  # expand now: $kf is out of scope when the trap runs
+  trap "rm -f '$kf'" EXIT
+  ( umask 077
+    printf '{"ai-kit-%s": "%s"}\n' "$p" "$(printf '%s' "$KEY" | sed 's/\\/\\\\/g; s/"/\\"/g')" >"$kf" )
+  LLM_USER_PATH="$DATA/llm" llm "$sub" -m "$p/$m" ${extra[@]+"${extra[@]}"} "$@"
+}
+cmd_ask()  { llm_run prompt "$@"; }
+cmd_repl() { llm_run chat "$@"; }
+
+cmd_chat() {   # web UI: ai chat [role|model]
+  local target="${1:-chat}" pm model v secret
+  have open-webui || die "open-webui missing. Re-run install.sh"
+  v="$(webui_version)"
+  if [ -n "$v" ] && ! version_ge "$v" "$OPEN_WEBUI_MIN"; then
+    die "Open WebUI $v is older than the required $OPEN_WEBUI_MIN (security fixes). Run: ai update"
+  fi
+  pm="$(resolve "$target" local 2>/dev/null || resolve "$target" cloud)"
+  model="${pm#*|}"
+  if [ "$(prov_kind "${pm%%|*}")" = cloud ] && [ "$MODE" != hybrid ]; then
+    die "'$target' is a cloud model and this machine is in local mode. To allow: ai mode hybrid"
+  fi
+  start_server
+  trap 'stop_server' EXIT
+  trap 'exit 130' INT TERM
+
+  # A stable secret, kept with the data instead of in the current directory.
+  secret="$DATA/webui-secret"
+  if [ ! -s "$secret" ]; then
+    (umask 077; { openssl rand -hex 32 2>/dev/null || od -An -N32 -tx1 /dev/urandom | tr -d ' \n'; } >"$secret")
+  fi
+
+  # Extra OpenAI-compatible connections: other local servers always; cloud
+  # providers only in hybrid mode and only when a key is set. Each connection
+  # is limited to the models listed for it in models.conf (empty = all).
+  local urls="" keys="" cfgs="{}" i=0 p kind k ids
+  for p in $(provider_rows | awk -F'|' '$1 != "ollama" { print $1 }'); do
+    kind="$(prov_kind "$p")"
+    if [ "$kind" = cloud ]; then
+      [ "$MODE" = hybrid ] || continue
+      k="$(key_get "$(prov_keyvar "$p")")"
+      [ -n "$k" ] || continue
+    else
+      k="local"
+    fi
+    urls="$urls${urls:+;}$(prov_url "$p")"
+    keys="$keys${keys:+;}$k"
+    ids="$(model_rows | awk -F'|' -v p="$p" '$2 == p && $1 != "image" && $1 != "embed" && !s[$3]++ { print $3 }' | jq -R . | jq -sc .)"
+    cfgs="$(jq -c --arg i "$i" --argjson ids "$ids" '. + {($i): {enable: true, model_ids: $ids}}' <<<"$cfgs")"
+    i=$((i + 1))
+  done
+
+  local skey embed
+  skey="$(cat "$secret")"
+  embed="$(pick embed local | cut -d'|' -f2)"
+  # Settings come from here, not the UI, so everyone runs the same configuration.
+  export OLLAMA_BASE_URL="$OLLAMA_URL" DEFAULT_MODELS="$model" \
+    DATA_DIR="$DATA/webui" WEBUI_SECRET_KEY="$skey" \
+    WEBUI_AUTH=False ENABLE_PERSISTENT_CONFIG=False \
+    OFFLINE_MODE=true HF_HUB_OFFLINE=1 ENABLE_VERSION_UPDATE_CHECK=false \
+    ANONYMIZED_TELEMETRY=False DO_NOT_TRACK=True SCARF_NO_ANALYTICS=True \
+    ENABLE_COMMUNITY_SHARING=False ENABLE_CODE_EXECUTION=False ENABLE_CODE_INTERPRETER=False \
+    ENABLE_WEB_SEARCH=False ENABLE_IMAGE_GENERATION=False ENABLE_VIDEO_GENERATION=False \
+    ENABLE_TOOL_SERVERS=False ENABLE_PLUGINS=False ENABLE_TOOL_PERMISSIONS=True \
+    RAG_EMBEDDING_ENGINE=ollama RAG_EMBEDDING_MODEL="$embed"
+  if [ -n "$urls" ]; then
+    export ENABLE_OPENAI_API=True OPENAI_API_BASE_URLS="$urls" OPENAI_API_KEYS="$keys" OPENAI_API_CONFIGS="$cfgs"
+  else
+    export ENABLE_OPENAI_API=False
+  fi
+  [ "$MODE" = hybrid ] && warn "hybrid mode: cloud models in the picker send your prompts and files to that provider."
+
+  mkdir -p "$DATA/webui"; cd "$DATA"
+  say "Starting chat ($MODE mode, default model $model) at http://127.0.0.1:$OPEN_WEBUI_PORT  (Ctrl-C to stop)"
+  ( sleep 6; open_url "http://127.0.0.1:$OPEN_WEBUI_PORT" ) &
+  open-webui serve --host 127.0.0.1 --port "$OPEN_WEBUI_PORT"
+}
+
+cmd_pick() {
+  have fzf || { usage; return 0; }
+  local line r l
+  line="$(for r in $(roles); do
+            [ "$r" = embed ] && continue
+            l="$(pick "$r" local)"
+            printf '%-8s %-26s %s\n' "$r" "$(echo "$l" | cut -d'|' -f2)" "$(echo "$l" | cut -d'|' -f3)"
+          done | fzf --prompt="role> " --header="Enter opens the chat window with this model")" || return 0
+  case "${line%% *}" in
+    image) say "Image generation runs in the terminal: ai image \"a description\"" ;;
+    "")    ;;
+    *)     cmd_chat "${line%% *}" ;;
+  esac
+}
+
+cmd_image() {   # ai image [--cloud] [-o dir] "description"
+  local want=local out="$PWD" pm p m f resp err
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c|--cloud) want=cloud ;;
+      -o|--out)   [ $# -ge 2 ] || die "$1 needs a folder"; out="$2"; shift ;;
+      -*)         die "unknown option $1" ;;
+      *)          break ;;
+    esac
+    shift
+  done
+  [ $# -gt 0 ] || die "usage: ai image [--cloud] [-o folder] \"description\""
+  pm="$(resolve image "$want")"; p="${pm%%|*}"; m="${pm#*|}"
+  mkdir -p "$out"
+  if [ "$p" = ollama ]; then
+    is_mac || die "Ollama image generation is macOS-only for now. Use: ai image --cloud \"...\" (hybrid mode)"
+    prepare "$p"
+    (cd "$out" && ollama run "$m" "$*")
+  elif [ "$p" = openai ]; then
+    prepare "$p"
+    f="$out/image-$(date +%Y%m%d-%H%M%S).png"
+    resp="$(jq -n --arg m "$m" --arg p "$*" '{model: $m, prompt: $p}' |
+            auth_curl "$p" -H 'Content-Type: application/json' --data @- "$URL/images/generations")"
+    err="$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null || true)"
+    [ -z "$err" ] || die "$p: $err"
+    printf '%s' "$resp" | jq -r '.data[0].b64_json // empty' | base64 --decode >"$f"
+    [ -s "$f" ] || { rm -f "$f"; die "no image returned"; }
+    say "Wrote $f"
+  else
+    die "image generation through '$p' is not wired up yet (see docs/extending.md)"
+  fi
+}
+
+cmd_code() {   # ai code [--cloud] [role|model] [-- claude args]
+  have claude || die "Claude Code is not installed (uncomment it in Brewfile and re-run install.sh)"
+  local want=local target=code pm m
+  case "${1:-}" in -c|--cloud) want=cloud; shift ;; esac
+  case "${1:-}" in ""|--) ;; *) target="$1"; shift ;; esac
+  [ "${1:-}" = -- ] && shift
+  if [ "$want" = cloud ]; then
+    [ "$MODE" = hybrid ] || die "cloud coding agent blocked: local mode. To allow: ai mode hybrid"
+    exec claude "$@"
+  fi
+  pm="$(resolve "$target" local)"; m="${pm#*|}"
+  start_server
+  # Ollama serves an Anthropic-compatible API, so Claude Code can drive a local model.
+  export ANTHROPIC_BASE_URL="$OLLAMA_URL" ANTHROPIC_AUTH_TOKEN="ollama" ANTHROPIC_API_KEY="" \
+         ANTHROPIC_DEFAULT_OPUS_MODEL="$m" ANTHROPIC_DEFAULT_SONNET_MODEL="$m" ANTHROPIC_DEFAULT_HAIKU_MODEL="$m" \
+         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+  warn "ai code with a local model is best-effort and not verified to make no outside connections."
+  claude --model "$m" "$@"
+}
+
+# ------------------------------------------------------------ models
+wanted_models() {   # role|model rows to download: the pick per role, or --all fitting rows
+  model_rows | awk -F'|' -v all="$1" -v ram="$(ram_gb)" '
+    $2 == "ollama" && $4 + 0 <= ram + 0 && (all || !seen[$1]++) { print $1 "|" $3 }'
+}
+
+cmd_sync() {   # ai sync [--all]
+  local all=0 role m r
+  [ "${1:-}" = --all ] && all=1
+  start_server
+  for r in $(roles); do
+    if [ -z "$(pick "$r" local)" ] && model_rows | awk -F'|' -v r="$r" '$1 == r && $2 == "ollama" { f = 1 } END { exit !f }'; then
+      say "skip   $r: no local model fits $(ram_gb)GB"
+    fi
+  done
+  wanted_models "$all" | while IFS='|' read -r role m; do
+    if [ "$role" = image ] && ! is_mac; then say "skip   $m (image generation is macOS-only)"; continue; fi
+    say "pull   $m  ($role)"
+    ollama pull "$m" </dev/null || say "FAILED $m - check the tag in models.conf"
+  done
+}
+
+cmd_prune() {   # remove Ollama models not listed in models.conf
+  start_server
+  local approved extra m
+  approved="$(model_rows | awk -F'|' '$2 == "ollama" { print $3 }' | while read -r m; do norm "$m"; done)"
+  extra="$(installed_models | while read -r m; do echo "$approved" | grep -qxF "$m" || echo "$m"; done)"
+  [ -n "$extra" ] || { say "Nothing to prune: every installed model is listed in models.conf."; return 0; }
+  say "Installed but not in models.conf:"; printf '%s\n' "$extra" | while read -r m; do say "  $m"; done
+  confirm "Remove them? Type yes:" yes || { say "Cancelled."; return 0; }
+  echo "$extra" | while read -r m; do ollama rm "$m"; done
+}
+
+cmd_models() {   # ai models | ai models --remote PROVIDER
+  if [ "${1:-}" = --remote ]; then
+    [ -n "${2:-}" ] || die "usage: ai models --remote <provider>"
+    prepare "$2"
+    auth_curl "$2" "$URL/models" | jq -r '.data[]?.id // empty' | sort
+    return 0
+  fi
+  local r l c st
+  printf '%-8s %-30s %-14s %s\n' ROLE "LOCAL PICK ($(ram_gb)GB)" STATUS "CLOUD PICK"
+  for r in $(roles); do
+    l="$(pick "$r" local | cut -d'|' -f1,2)"; c="$(pick "$r" cloud | cut -d'|' -f1,2)"
+    st="-"
+    if [ -n "$l" ]; then
+      if [ "${l%%|*}" != ollama ]; then st="external"
+      elif ! server_up; then st="(server off)"
+      elif is_installed "${l#*|}"; then st="installed"
+      else st="not pulled"; fi
+    fi
+    printf '%-8s %-30s %-14s %s\n' "$r" "${l#*|}" "$st" "${c:+${c%%|*}/${c#*|}}"
+  done
+  [ "$MODE" = local ] && say "" && say "Mode: local. Cloud picks are listed but blocked (ai mode hybrid to allow)."
+  server_up || say "Start Ollama to see install status: ai status, or ai sync"
+}
+
+cmd_smoke() {   # ai smoke [--cloud] [target]
+  local s e t=chat cloud=""
+  case "${1:-}" in -c|--cloud) cloud="--cloud"; shift ;; esac
+  [ -n "${1:-}" ] && t="$1"
+  s=$(date +%s)
+  if [ -n "$cloud" ]; then cmd_ask --cloud "$t" "Reply with the single word READY."
+  else cmd_ask "$t" "Reply with the single word READY."; fi
+  e=$(date +%s); say "$(cmd_which ${cloud:+--cloud} "$t" | cut -d' ' -f1) answered in $((e - s))s (includes load time)"
+}
+
+# ------------------------------------------------------------ writing helpers
+cmd_prompt() {   # ai prompt [name]
+  local d f n pack
+  if [ -z "${1:-}" ]; then
+    say "Prompts (copy with: ai prompt <name>, or use with: ai ask -p <name> ...):"
+    for d in "$CFG_DIR/prompts" "$KIT/prompts"; do
+      for f in "$d"/*.md; do [ -f "$f" ] || continue; n="$(basename "$f" .md)"; case "$n" in _*) continue ;; esac; say "  $n"; done
+    done
+    for d in "$CFG_DIR"/packs/*/prompts "$KIT"/packs/*/prompts; do
+      [ -d "$d" ] || continue; pack="$(basename "$(dirname "$d")")"
+      for f in "$d"/*.md; do [ -f "$f" ] || continue; n="$(basename "$f" .md)"; case "$n" in _*) continue ;; esac; say "  $pack/$n"; done
+    done
+    return 0
+  fi
+  prompt_file "$1" >/dev/null || die "no prompt '$1'. List them with: ai prompt"
+  if prompt_text "$1" | clip 2>/dev/null; then
+    say "Copied '$1' to the clipboard. Paste it as your first message."
+  else
+    prompt_text "$1"
+  fi
+}
+
+cmd_docx() {
+  have pandoc || die "pandoc missing. Re-run install.sh"
+  [ -f "${1:-}" ] || die "usage: ai docx <file.md> [template.docx]"
+  local out="${1%.*}.docx"
+  if [ -n "${2:-}" ]; then pandoc "$1" --reference-doc="$2" -o "$out"; else pandoc "$1" -o "$out"; fi
+  say "Wrote $out"
+}
+
+cmd_ocr() {
+  have ocrmypdf || die "ocrmypdf missing. Re-run install.sh"
+  [ -f "${1:-}" ] || die "usage: ai ocr <file.pdf>"
+  local out="${1%.*}-ocr.pdf"
+  ocrmypdf --skip-text "$1" "$out" && say "Wrote $out"
+}
+
+# ------------------------------------------------------------ settings
+cmd_mode() {
+  case "${1:-}" in
+    "")  say "Mode: $MODE$([ -n "${AI_MODE:-}" ] && echo ' (from AI_MODE)')"
+         if [ "$MODE" = local ]; then say "Cloud providers are blocked."
+         else say "Cloud providers with a key can be used when asked for."; fi ;;
+    local|hybrid)
+         cfg_set mode "$1"; say "Mode set to $1."
+         [ "$1" = hybrid ] && say "Cloud models are now allowed. Add keys with: ai key set <provider>"
+         [ -n "${AI_MODE:-}" ] && warn "AI_MODE=$AI_MODE in your environment still overrides this." ;;
+    *)   die "usage: ai mode [local|hybrid]" ;;
+  esac
+}
+
+cmd_key() {   # ai key [list] | set PROVIDER | rm PROVIDER
+  local action="${1:-list}" p="${2:-}" v k
+  case "$action" in
+    list)
+      for p in $(provider_rows | awk -F'|' '$2 == "cloud" { print $1 }'); do
+        v="$(prov_keyvar "$p")"
+        if [ -n "$(key_get "$v")" ]; then k="set"; else k="-"; fi
+        printf '  %-12s %-22s %s\n' "$p" "$v" "$k"
+      done ;;
+    set)
+      [ -n "$p" ] || die "usage: ai key set <provider>"
+      v="$(prov_keyvar "$p")"; [ -n "$v" ] || die "provider '$p' has no key variable in providers.conf"
+      if is_mac; then
+        say "Saving $v in the macOS Keychain (service '$KEYCHAIN_SERVICE'). Paste the key when asked."
+        security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$v" -w
+      else
+        printf 'Paste the %s key (input hidden): ' "$p" >/dev/tty; read -rs k </dev/tty; echo >/dev/tty
+        [ -n "$k" ] || die "empty key"
+        mkdir -p "$CFG_DIR"
+        ( umask 077; { [ -f "$KEYS_FILE" ] && grep -v "^$v=" "$KEYS_FILE" || true; printf '%s=%s\n' "$v" "$k"; } >"$KEYS_FILE.tmp"; mv "$KEYS_FILE.tmp" "$KEYS_FILE" )
+        chmod 600 "$KEYS_FILE"
+        say "Saved to $KEYS_FILE (mode 600)."
+      fi ;;
+    rm)
+      [ -n "$p" ] || die "usage: ai key rm <provider>"
+      v="$(prov_keyvar "$p")"
+      is_mac && security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$v" >/dev/null 2>&1 || true
+      if [ -f "$KEYS_FILE" ]; then ( umask 077; grep -v "^$v=" "$KEYS_FILE" >"$KEYS_FILE.tmp" || true; mv "$KEYS_FILE.tmp" "$KEYS_FILE" ); fi
+      say "Removed the stored key for $p (an environment variable $v, if set, still applies)." ;;
+    *) die "usage: ai key [list|set <provider>|rm <provider>]" ;;
+  esac
+}
+
+cmd_log() {   # ai log [on|off]  - terminal prompt history (llm's database)
+  case "${1:-}" in
+    "")     say "Prompt logging for ai ask: $( [ "$(cfg_get log)" = off ] && echo off || echo on ) ($DATA/llm)" ;;
+    on|off) cfg_set log "$1"; say "Prompt logging $1." ;;
+    *)      die "usage: ai log [on|off]" ;;
+  esac
+}
+
+# ------------------------------------------------------------ status & health
+check_config() {   # prints problems; returns 1 if any
+  local bad=0 line
+  while IFS= read -r line; do [ -n "$line" ] || continue; say "  BAD      $line"; bad=1; done <<EOF2
+$(provider_rows | awk -F'|' 'NF != 4 || ($2 != "local" && $2 != "cloud") { print "providers.conf: " $0 " (want name|local or cloud|url|KEY_VAR)" }'
+  model_rows | awk -F'|' -v kinds="$(kinds)" '
+    BEGIN { n = split(kinds, a, " "); for (i = 1; i <= n; i++) { split(a[i], kv, "="); K[kv[1]] = 1 } }
+    NF < 4 || NF > 5 { print "models.conf: " $0 " (want role|provider|model|min_RAM_GB|note)"; next }
+    !($2 in K) { print "models.conf: " $0 " (unknown provider " $2 ")"; next }
+    $4 !~ /^[0-9]+$/ { print "models.conf: " $0 " (min_RAM_GB must be a number)" }')
+EOF2
+  [ $bad = 0 ] && say "  ok       providers.conf and models.conf"
+  return $bad
+}
+
+cmd_status() {
+  say "ai-kit  $KIT"
+  say "Mode    $MODE"
+  if server_up; then
+    if [ -f "$DATA/ollama.pid" ]; then say "Ollama  running (started by ai-kit)"; else say "Ollama  running (external)"; fi
+    ollama ps 2>/dev/null | sed 's/^/        /'
+  else say "Ollama  stopped"; fi
+  if pgrep -f "open-webui serve" >/dev/null 2>&1; then say "Chat    running at http://127.0.0.1:$OPEN_WEBUI_PORT"; else say "Chat    stopped"; fi
+  say "Disk    models $(du -sh "$HOME/.ollama/models" 2>/dev/null | cut -f1 || echo 0)   data $(du -sh "$DATA" 2>/dev/null | cut -f1)"
+}
+
+cmd_doctor() {
+  local v c enc
+  say "ai-kit   $KIT ($(git -C "$KIT" describe --tags --always 2>/dev/null || echo 'not a git checkout'))"
+  say "Mode     $MODE"
+  say "Ollama   $OLLAMA_URL$( [ -n "${AI_OLLAMA_ADDR:-}" ] && echo '  (remote, from AI_OLLAMA_ADDR: prompts cross the network)')"
+  say "System   $OS $(uname -m), $(ram_gb)GB RAM"
+  if is_mac; then enc="$(fdesetup status 2>/dev/null | head -n 1 || echo unknown)"
+  elif have lsblk && lsblk -o TYPE 2>/dev/null | grep -q crypt; then enc="an encrypted (LUKS) volume is present"
+  else enc="not detected"; fi
+  say "Disk encryption: $enc"
+  for c in ollama uv open-webui llm jq fzf pandoc ocrmypdf curl git; do
+    if have "$c"; then say "  ok       $c"; else say "  MISSING  $c"; fi
+  done
+  have ollama && say "Ollama   $(ollama --version 2>&1 | tail -n 1)"
+  v="$(webui_version)"
+  if [ -z "$v" ]; then say "Open WebUI: not found"
+  elif version_ge "$v" "$OPEN_WEBUI_MIN"; then say "Open WebUI: $v (minimum $OPEN_WEBUI_MIN) ok"
+  else say "Open WebUI: $v is BELOW the required $OPEN_WEBUI_MIN - run: ai update"; fi
+  have llm && say "llm      $(llm --version 2>/dev/null)"
+  check_config || true
+
+  start_server
+  if grep -qi 'cloud disabled: true' "$DATA/ollama.log" 2>/dev/null || grep -q '"disable_ollama_cloud": *true' "$HOME/.ollama/server.json" 2>/dev/null; then
+    say "  ok       Ollama cloud features are disabled"
+  else
+    say "  WARN     cannot confirm Ollama cloud is disabled. If the Ollama desktop app is running, quit it, run 'ai stop', retry."
+  fi
+  if [ ! -f "$DATA/ollama.pid" ]; then
+    say "  NOTE     Ollama was already running, so ai-kit's settings may not apply to it."
+  fi
+  say ""; cmd_models
+  if [ "$MODE" = hybrid ]; then say ""; say "Cloud keys:"; cmd_key list; fi
+  say ""; say "Non-local network connections from AI processes (should be none in local mode):"
+  if have lsof; then
+    lsof -i -nP 2>/dev/null | grep -E 'ollama|open-webui|python|llm|claude' \
+      | grep -v -E '127\.0\.0\.1|\[::1\]|localhost' || say "  none"
+  else say "  (lsof not installed; cannot check)"; fi
+}
+
+# ------------------------------------------------------------ data lifecycle
+cmd_backup() {
+  [ -d "$DATA/webui" ] || { say "No chat data to back up."; return 0; }
+  mkdir -p "$DATA/backups"
+  local f; f="$DATA/backups/webui-$(date +%Y%m%d-%H%M%S).tgz"
+  ( umask 077; tar -czf "$f" -C "$DATA" webui )
+  say "Wrote $f"
+}
+
+cmd_wipe() {
+  say "This permanently deletes chat history, uploads, search indexes, prompt logs and backups in $DATA."
+  confirm "Type WIPE to continue:" WIPE || { say "Cancelled."; return 1; }
+  stop_webui; stop_server
+  rm -rf "$DATA/webui" "$DATA/llm" "$DATA/backups" "$DATA/webui-secret"
+  say "Done. (On SSDs this is not a secure erase; disk encryption is the control.)"
+}
+
+brew_formulae() { awk '/^brew "/ { gsub(/"/, "", $2); print $2 }' "$KIT/Brewfile"; }
+
+cmd_update() {   # needs internet
+  say "== Kit ==";    git -C "$KIT" pull --ff-only || say "(not a git checkout, or offline: skipped)"
+  say "== Backup =="; cmd_backup
+  say "== Tools =="
+  if have brew; then
+    brew bundle --file="$KIT/Brewfile"
+    # shellcheck disable=SC2046
+    brew upgrade $(brew_formulae) || true
+  fi
+  uv tool upgrade open-webui || true
+  uv tool upgrade llm || true
+  say "== Models =="; cmd_sync
+  say ""; say "Test with 'ai smoke' and a sample document, then run: ai lock"
+}
+
+tool_versions() {
+  # shellcheck disable=SC2046
+  { if have brew; then brew list --versions $(brew_formulae) 2>/dev/null || true; fi
+    echo "open-webui $(webui_version)"
+    echo "llm $(llm --version 2>/dev/null | awk '{ print $NF }')"; }
+}
+cmd_lock() {
+  start_server
+  ollama list | awk 'NR > 1 { print $1, $2 }' | sort >"$KIT/models.lock"
+  tool_versions >"$KIT/tools.lock"
+  say "Wrote models.lock and tools.lock - commit both."
+}
+cmd_verify() {
+  [ -f "$KIT/models.lock" ] || die "no models.lock yet. Run: ai lock"
+  start_server
+  local bad
+  bad="$(ollama list | awk 'NR > 1 { print $1, $2 }' | while read -r l; do grep -qxF "$l" "$KIT/models.lock" || echo "MISMATCH: $l"; done)"
+  if [ -z "$bad" ]; then say "OK: installed models match models.lock"; else say "$bad"; exit 1; fi
+  if [ -f "$KIT/tools.lock" ]; then
+    if tool_versions | diff "$KIT/tools.lock" - >/dev/null; then say "OK: tool versions match tools.lock"
+    else say "NOTE: tool versions differ from tools.lock; the maintainer decides whether to re-lock."; fi
+  fi
+}
+cmd_export() { local f="${1:-ai-models-$(date +%Y%m%d).tar}"; tar -cf "$f" -C "$HOME/.ollama" models && say "Wrote $f"; }
+cmd_import() {
+  [ -f "${1:-}" ] || die "usage: ai import <file.tar>"
+  stop_server; mkdir -p "$HOME/.ollama"; tar -xf "$1" -C "$HOME/.ollama"
+  say "Imported. Run: ai verify"
+}
+
+cmd_uninstall() {   # ai uninstall [--all]
+  local all=0 rc v p
+  [ "${1:-}" = --all ] && all=1
+  say "This removes: the ai command, Open WebUI and llm (uv tools), and your chat data in $DATA."
+  [ $all = 1 ] && say "With --all it also removes: downloaded models (~/.ollama/models), stored API keys, and $CFG_DIR."
+  confirm "Type UNINSTALL to continue:" UNINSTALL || { say "Cancelled."; return 1; }
+  stop_webui; stop_server
+  have uv && { uv tool uninstall open-webui >/dev/null 2>&1 || true; uv tool uninstall llm >/dev/null 2>&1 || true; }
+  if [ -L "$HOME/.local/bin/ai" ]; then rm -f "$HOME/.local/bin/ai"; fi
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
+    [ -f "$rc" ] && grep -q '# ai-kit$' "$rc" && sed -i.ai-kit-bak '/# ai-kit$/d' "$rc"
+  done
+  rm -rf "$DATA"
+  if [ $all = 1 ]; then
+    rm -rf "$HOME/.ollama/models"
+    for p in $(provider_rows | awk -F'|' '$2 == "cloud" { print $1 }'); do
+      v="$(prov_keyvar "$p")"
+      is_mac && security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$v" >/dev/null 2>&1 || true
+    done
+    rm -rf "$CFG_DIR"
+  fi
+  say "Removed. Left in place on purpose:"
+  say "  Homebrew packages:  brew uninstall $(brew_formulae | tr '\n' ' ')"
+  say "  Ollama settings:    ~/.ollama/server.json"
+  say "  The kit itself:     rm -rf \"$KIT\""
+}
+
+# ------------------------------------------------------------ help & dispatch
+usage() { cat <<EOF
+ai - local and cloud models from one command  (mode: $MODE)
+
+Use
+  ai                          pick a role, open the chat window
+  ai chat [role|model]        chat window in the browser (default role: chat)
+  ai ask  [opts] <target> [text]   one-shot answer in the terminal (reads stdin too)
+  ai repl [opts] <target>     interactive chat in the terminal
+      opts: -c/--cloud  use the role's cloud model     -p <prompt>  add a saved prompt
+            -f <file>   attach a text file (repeatable)
+  ai image [-c] [-o dir] "description"    generate an image
+  ai code [-c] [role|model] [-- args]     coding agent (Claude Code), local or cloud
+  ai which [-c] <target>      show which provider/model a target resolves to
+
+  target = a role (chat, write, code, vision, image), provider/model, or an Ollama tag
+
+Writing helpers
+  ai prompt [name]            list saved prompts, or copy one to the clipboard
+  ai docx file.md [tpl.docx]  Markdown -> Word        ai ocr scan.pdf   make a scan readable
+
+Models
+  ai models [--remote p]      roles and what each resolves to (or list a provider's models)
+  ai sync [--all]             download the local pick for each role that fits this machine
+  ai prune                    remove local models no longer in models.conf
+  ai smoke [-c] [target]      quick test that a model answers
+
+Settings
+  ai mode [local|hybrid]      local blocks all cloud providers (default)
+  ai key [list|set p|rm p]    store cloud API keys (Keychain on macOS)
+  ai log [on|off]             keep a local history of ai ask prompts
+
+Run and maintain
+  ai status | ai doctor       what is running / full health check
+  ai check                    validate providers.conf and models.conf
+  ai stop                     stop the chat window and the model server
+  ai backup | ai wipe         back up / delete chats, uploads, logs
+  ai update                   update kit, tools and models (needs internet)
+  ai lock | ai verify         record / check approved model and tool versions
+  ai export | ai import f     move models without internet
+  ai uninstall [--all]        remove ai-kit (--all: models, keys and settings too)
+EOF
+}
+
+main() {
+  local cmd="${1:-pick}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    pick)       cmd_pick ;;
+    chat)       cmd_chat "$@" ;;
+    ask)        cmd_ask "$@" ;;
+    repl)       cmd_repl "$@" ;;
+    image)      cmd_image "$@" ;;
+    code)       cmd_code "$@" ;;
+    which)      cmd_which "$@" ;;
+    prompt)     cmd_prompt "$@" ;;
+    docx)       cmd_docx "$@" ;;
+    ocr)        cmd_ocr "$@" ;;
+    models)     cmd_models "$@" ;;
+    sync)       cmd_sync "$@" ;;
+    prune)      cmd_prune ;;
+    smoke)      cmd_smoke "$@" ;;
+    mode)       cmd_mode "$@" ;;
+    key|keys)   cmd_key "$@" ;;
+    log)        cmd_log "$@" ;;
+    status)     cmd_status ;;
+    doctor)     cmd_doctor ;;
+    check)      check_config ;;
+    stop)       stop_webui; stop_server; say "Stopped." ;;
+    backup)     cmd_backup ;;
+    wipe)       cmd_wipe ;;
+    update)     cmd_update ;;
+    lock)       cmd_lock ;;
+    verify)     cmd_verify ;;
+    export)     cmd_export "$@" ;;
+    import)     cmd_import "$@" ;;
+    uninstall)  cmd_uninstall "$@" ;;
+    help|-h|--help) usage ;;
+    *)          usage; exit 1 ;;
+  esac
+}
+
+main "$@"
