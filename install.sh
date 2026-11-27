@@ -2,7 +2,7 @@
 # ai-kit installer. Safe to re-run. Needs internet.
 #
 # One line:
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/ai-kit/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/sean-aura/ai-kit/refs/heads/main/install.sh | bash
 #
 # Options (environment variables):
 #   AIKIT_REF=v0.2.0      install a tagged release instead of main (recommended for teams)
@@ -12,7 +12,7 @@
 #   AIKIT_REPO=<git url>  install from a fork or internal mirror
 set -euo pipefail
 
-REPO="${AIKIT_REPO:-https://github.com/OWNER/ai-kit.git}"
+REPO="${AIKIT_REPO:-https://github.com/sean-aura/ai-kit.git}"
 REF="${AIKIT_REF:-main}"
 DEST="${AIKIT_HOME:-$HOME/.ai-kit}"
 

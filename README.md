@@ -17,7 +17,7 @@ ai chat                                            # a full chat window in your 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/ai-kit/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sean-aura/ai-kit/refs/heads/main/install.sh | bash
 ```
 
 That clones the kit to `~/.ai-kit`, installs the tools with Homebrew, and links `ai` into `~/.local/bin`. Then open a new terminal:
