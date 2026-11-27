@@ -17,6 +17,9 @@ Reworked from the offline-only "local-ai-kit" into a local-first kit that can al
 - Explicit memory: `ai remember`, `ai memory`, `ai forget`. The chat window's background memory review is forced off.
 - Incognito mode (`ai incognito <command>` / `ai -i`): a throwaway space deleted on exit, with no memory.
 - `ai wipe [local|hybrid|all]`.
+- Skills (Agent Skills `SKILL.md` folders) in `skills/` and `~/.config/ai-kit/skills/`: `ai ask -p <skill>`, `ai skills claude` (links into Claude Code, recorded in the receipt), `ai skills export` (zip for the chat window's Skills import).
+- `~/.config/ai-kit/webui.env` for chat-window setting overrides. Mode- and space-critical settings are protected.
+- README "Where things live": every file, folder and environment variable that controls ai-kit.
 - Install receipt (`ai receipt`). `ai uninstall [--all] [--dry-run]` removes only what ai-kit added, including Homebrew dependencies, the uv Python download, models and folders, and restores what it changed (an existing `ai` command, Ollama's settings file). `ai prune` only removes models ai-kit downloaded unless given `--all`.
 - Install no longer upgrades tools you already had.
 - Folders are created only when something is written, so `ai help` and dry runs leave no trace.
@@ -33,6 +36,8 @@ Reworked from the offline-only "local-ai-kit" into a local-first kit that can al
 **Fixed**
 - `ai sync` no longer lets `ollama pull` read from the loop's input.
 - Cloud API keys never appear in process arguments.
+- PATH setup: uses `~/.bash_profile` for bash on macOS (Terminal opens login shells), always adds a guarded PATH line even if this session already has `~/.local/bin` on PATH, and gives a clear fish instruction. The installer ends by saying exactly what to do in the current terminal.
+- A reinstall after `ai uninstall` now reinstalls open-webui and llm. The installer fails loudly if they can't run.
 - The installer stopped silently on machines missing a standard folder (e.g. a fresh machine with no uv Python folder).
 
 **Breaking**

@@ -63,6 +63,8 @@ run_machine() {   # run_machine NAME SETUP_FUNCTION
 setup_fresh() { :; }
 check_fresh() {
   local A="$1" R="$2" before="$3" mid
+  "$A" skills claude >/dev/null 2>&1
+  [ -e "$HOME/.claude" ] && bad "fresh: no Claude Code, no ~/.claude created" "$(ls -la "$HOME/.claude")" || ok "fresh: no Claude Code, no ~/.claude created"
   # Uninstall then reinstall (a common "turn it off and on again") must bring every tool back.
   "$A" uninstall >"$L/uninstall0.log" 2>&1
   AIKIT_REPO="file://$W/repo" bash <"$W/repo/install.sh" >"$L/install3.log" 2>&1 || bad "fresh: reinstall after uninstall" "$(tail -5 "$L/install3.log")"
@@ -88,11 +90,18 @@ setup_lived_in() {
   echo manifest >"$HOME/.ollama/models/manifests/qwen3:8b"      # also in models.conf
   echo '{"other_setting": 1, "disable_ollama_cloud": false}' >"$HOME/.ollama/server.json"
   echo 'theme=dark' >"$HOME/.config/other-app/settings"
+  mkdir -p "$HOME/.claude/skills/plain-english"                       # your own skill, same name as the kit's
+  printf -- '---\nname: plain-english\n---\nmine\n' >"$HOME/.claude/skills/plain-english/SKILL.md"
 }
 check_lived_in() {
   local A="$1" R="$2" before="$3"
   grep -q '^uv_tool|llm|preexisting' "$HOME/.config/ai-kit/receipt" && ok "lived-in: your llm recorded as already here" || bad "lived-in: llm recorded" "$(cat "$HOME/.config/ai-kit/receipt")"
   [ "$(cat "$HOME/.local/bin/ai.pre-ai-kit" 2>/dev/null)" = "$(printf '#!/bin/sh\necho my own ai script')" ] && ok "lived-in: your ai script set aside, not overwritten" || bad "lived-in: ai script kept" "$(ls -la "$HOME/.local/bin")"
+  mkdir -p "$HOME/.config/ai-kit/skills/extra"                       # a personal ai-kit skill to link
+  printf -- '---\nname: extra\ndescription: test\n---\nbody\n' >"$HOME/.config/ai-kit/skills/extra/SKILL.md"
+  "$A" skills claude >"$L/skills.log" 2>&1
+  [ -L "$HOME/.claude/skills/extra" ] && ok "lived-in: skill linked into Claude Code" || bad "lived-in: skill linked" "$(cat "$L/skills.log")"
+  grep -q 'skip    plain-english' "$L/skills.log" && [ ! -L "$HOME/.claude/skills/plain-english" ] && ok "lived-in: your same-named Claude skill left alone" || bad "lived-in: claude skill kept" "$(cat "$L/skills.log")"
   "$A" prune >"$L/prune.log" 2>&1
   [ -f "$HOME/.ollama/models/manifests/llama3.2:3b" ] && ok "lived-in: prune leaves your own model alone" || bad "lived-in: prune kept model" "$(cat "$L/prune.log")"
 

@@ -41,6 +41,28 @@ translate|gemini|gemini-3.8-flash|0|
 
 Then `ai ask translate "..."` and `ai chat translate` work straight away.
 
+## Add a skill
+
+```
+~/.config/ai-kit/skills/release-notes/     # or skills/release-notes/ in the repo for the team
+  SKILL.md
+```
+
+```markdown
+---
+name: release-notes
+description: Write release notes from a list of changes. Use when asked for release notes or a changelog entry.
+---
+
+Group changes as Added, Changed and Fixed. One line each, past tense, no internal ticket numbers.
+```
+
+Then `ai ask -p release-notes ...`, `ai skills claude` for Claude Code, or `ai skills export` and import it in the chat window. See the README's Skills section.
+
+## Change a chat-window setting
+
+Add `KEY=value` lines to `~/.config/ai-kit/webui.env` (Open WebUI's environment variable names). Settings that decide the mode or the space are protected and ignored there. To change the team default instead, edit the settings in `cmd_chat` in `bin/ai`.
+
 ## Add a prompt pack
 
 ```

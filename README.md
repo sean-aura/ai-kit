@@ -20,7 +20,7 @@ ai chat                                            # a full chat window in your 
 curl -fsSL https://raw.githubusercontent.com/sean-aura/ai-kit/refs/heads/main/install.sh | bash
 ```
 
-That clones the kit to `~/.ai-kit`, installs the tools with Homebrew, and links `ai` into `~/.local/bin`. Then open a new terminal:
+That clones the kit to `~/.ai-kit`, installs the tools with Homebrew, and links `ai` into `~/.local/bin`. An installer can't change the PATH of the terminal it runs in, so the last line it prints tells you what to do: run the `source ~/.zshrc` line it shows (or whichever file your shell uses), or open a new terminal. Then:
 
 ```bash
 ai sync      # download the local models that fit this machine (large: tens of GB)
@@ -35,6 +35,8 @@ curl -fsSL .../install.sh | AIKIT_REF=v0.2.0 bash   # pin a release (recommended
 curl -fsSL .../install.sh | AIKIT_SYNC=1 bash       # also download models now
 curl -fsSL .../install.sh | AIKIT_SKIP_DEPS=1 bash  # no Homebrew: bring your own ollama, uv, jq
 ```
+
+Running the one-liner again updates an existing install. On fish, run `fish_add_path ~/.local/bin` once, because ai-kit doesn't edit fish's config.
 
 Prefer to read before you run? `git clone` the repo, read `install.sh`, then run `./install.sh`. It's the same script.
 
@@ -73,6 +75,18 @@ ai mode local                # back to local only
 ```
 
 Hybrid mode never sends anything to the cloud on its own: the default for every role is still the local model. It does make it *possible* to pick a cloud model, so use local mode (or `AI_MODE=local` in the environment, which overrides the setting) for material that must not leave the machine. See [SECURITY.md](SECURITY.md).
+
+## Skills
+
+A skill is a folder containing a `SKILL.md`: a short header (`name`, `description`) and then instructions. Models don't store skills. Each tool reads skills from its own location and passes them to whichever model it's using. So where a skill goes depends on the tool:
+
+| Tool | Where its skills go | How to use them |
+|---|---|---|
+| Claude Code (`ai code`) | `~/.claude/skills/<name>/SKILL.md` for all your projects, or `<project>/.claude/skills/<name>/SKILL.md` for one project | Claude Code uses them automatically when relevant, or type `/<name>` |
+| Chat window (`ai chat`) | Not a folder: **Workspace > Skills** (create, or **Import** a `.md` or `.zip`). Stored in that mode's chat database, so local and hybrid mode each have their own. | Type `$` in a chat, or attach skills to a model under **Workspace > Models** |
+| Terminal (`ai ask`, `ai repl`) | `~/.config/ai-kit/skills/<name>/SKILL.md` for yours, or `skills/<name>/SKILL.md` in the repo for the team | `ai ask -p <name> ...` |
+
+The format is the same everywhere, so one skill folder can be copied to each location. To save the copying, `ai skills claude` links the ai-kit skills into `~/.claude/skills/`, and `ai skills export` zips them for the chat window's Import. `ai skills` lists them.
 
 ## Memory, spaces and incognito
 
@@ -118,7 +132,8 @@ Incognito covers this machine only. If you pick a cloud model, that provider's o
 | `ai repl [-c] <target>` | Interactive chat in the terminal |
 | `ai image [-c] [-o dir] "description"` | Generate an image (local generation is macOS-only for now) |
 | `ai code [-c] [target]` | Claude Code against a local model, or normally with `-c` |
-| `ai prompt [name]` | List saved prompts, or copy one to the clipboard |
+| `ai prompt [name]` | List prompts and skills, or copy one to the clipboard |
+| `ai skills` / `ai skills claude` / `ai skills export` | List skills / link them into Claude Code / zip them for the chat window |
 | `ai docx file.md [template.docx]` / `ai ocr scan.pdf` | Markdown to Word / make a scanned PDF readable |
 | `ai models` / `ai which <target>` / `ai models --remote <provider>` | What each role resolves to / one target / a provider's live model list |
 | `ai sync` / `ai prune [--all]` | Download the picks for this machine / delete unlisted models ai-kit downloaded |
@@ -174,6 +189,75 @@ At the end, `--all` lists anything new in your home, `~/.cache` and `~/Library` 
 | Clean slate: everything ai-kit added, nothing else | `ai uninstall --all` |
 | Free disk (models ai-kit downloaded that are no longer listed) | `ai prune` (`--all` also includes models you downloaded yourself) |
 
+## Where things live
+
+**Team defaults: in the repo.** Change these by commit; everyone gets them on `ai update`.
+
+| File or folder | Controls |
+|---|---|
+| `kit.conf` | Default mode, Open WebUI minimum version and port, Ollama address, context window, Python version |
+| `providers.conf` | Where models run: local servers and cloud providers |
+| `models.conf` | Which model serves each role, by RAM |
+| `Brewfile` | Tools the installer adds |
+| `prompts/`, `packs/<name>/prompts/` | Saved prompts. A pack's `_rules.md` is added to each of its prompts. |
+| `skills/<name>/SKILL.md` | Team skills |
+
+**Your own settings: `~/.config/ai-kit/`.** These survive updates. `ai uninstall` keeps them; `--all` removes them.
+
+| File or folder | Controls |
+|---|---|
+| `config` | Mode and logging (set with `ai mode`, `ai log`; no need to edit by hand) |
+| `models.conf`, `providers.conf` | Your additions. Same format as the repo's, read first so they win. |
+| `prompts/`, `packs/`, `skills/` | Your own prompts, packs and skills |
+| `webui.env` | Chat-window settings, one `KEY=value` per line (see below) |
+| `keys.env` | Cloud API keys on Linux (mode 600). On macOS, keys are in the Keychain under the service name `ai-kit`. |
+| `receipt`, `home-snapshot`, `originals/` | The install record. Don't edit these. |
+
+**Your data: `~/.local/share/ai-kit/`** (mode 700, readable by your user only)
+
+| Folder or file | Holds |
+|---|---|
+| `spaces/local/`, `spaces/hybrid/` | Each mode's chat window (history, uploads, document indexes, its memories, and Workspace items such as imported skills and prompts), terminal history (`llm/logs.db`) and terminal memory (`memory.md`) |
+| `incognito/` | Throwaway sessions, deleted when they end |
+| `backups/` | From `ai backup` (and automatically before `ai update`) |
+| `ollama.log` | Log of the model server ai-kit started |
+
+**Places owned by other tools.** ai-kit only touches these as noted.
+
+| Location | Notes |
+|---|---|
+| `~/.ollama/models/` | Downloaded models (Ollama's store) |
+| `~/.ollama/server.json` | Ollama's settings. ai-kit turns off Ollama's cloud features here; `uninstall --all` restores the original. |
+| `~/.claude/skills/` | Claude Code's skills. `ai skills claude` adds links here. |
+| `~/.claude/settings.json` | Claude Code's own settings. ai-kit doesn't touch it. |
+| `~/.zshrc`, `~/.bash_profile`, `~/.bashrc` or `~/.profile` | One PATH line, marked `# ai-kit` |
+| `~/.local/bin/ai` | Link to the kit's `bin/ai` |
+| `~/.ai-kit/` | The kit itself (a git checkout) |
+
+**Chat-window settings (`webui.env`).** ai-kit starts the chat window with locked-down settings each time, so changes made in its Admin Settings don't stick. To change one, add it to `~/.config/ai-kit/webui.env`:
+
+```
+# ~/.config/ai-kit/webui.env
+ENABLE_PLUGINS=True
+```
+
+`ai chat` applies these on top of ai-kit's defaults and says how many it applied; `ai doctor` lists them. Settings that decide the mode or the space (`DATA_DIR`, the `OPENAI_API_*` connections, `ENABLE_OPENAI_API`, `OLLAMA_BASE_URL`, `ENABLE_MEMORIES`, `OFFLINE_MODE`, `WEBUI_SECRET_KEY`) are ignored there with a warning, so this file can't turn on cloud models in local mode. Workspace items you create in the chat window (skills, prompts, knowledge) are kept, per space.
+
+**Environment variables.** Set these for one command (`AI_MODE=local ai ask ...`) or in your shell profile.
+
+| Variable | Effect |
+|---|---|
+| `AI_MODE` | `local` or `hybrid`; overrides `ai mode` |
+| `AI_CTX` | Context window for local models |
+| `AI_RAM_GB` | Pretend the machine has this much RAM (preview another machine's picks) |
+| `AI_OLLAMA_ADDR` | Use an Ollama server elsewhere, e.g. a team GPU box |
+| `AI_DATA`, `AIKIT_CONFIG_DIR` | Move the data or settings folders |
+| `AI_INCOGNITO=1` | Same as `ai incognito` |
+| `AIKIT_YES=1` | Answer yes to confirmations (for scripts) |
+| `OLLAMA_KEEP_ALIVE` | How long a model stays in memory after use (default 10m) |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` | Override stored keys |
+| `AIKIT_REF`, `AIKIT_HOME`, `AIKIT_SYNC`, `AIKIT_SKIP_DEPS`, `AIKIT_REPO` | Installer options (see Install) |
+
 ## Extending
 
 Everything is a line in a text file: add a provider (any OpenAI-compatible endpoint: OpenRouter, Mistral, LM Studio, vLLM, a company gateway), add or swap a model, add a role, add a prompt pack, point at a shared GPU server. See [docs/extending.md](docs/extending.md).
@@ -187,6 +271,7 @@ Everything is a line in a text file: add a provider (any OpenAI-compatible endpo
 - **Local image generation** relies on Ollama's experimental, macOS-only support.
 - **"Remember this" in the chat window** needs a model with native tool calling, and it's unconfirmed whether ai-kit's `ENABLE_PLUGINS=False` also switches off Open WebUI's built-in memory tools. Adding memories by hand in Settings > Personalization works either way. Check on the pilot.
 - **Clean slate is proven with stand-ins, not yet on a real Mac.** The test uses stand-ins for Homebrew, uv and Ollama. Open WebUI may write caches the stand-ins don't model (for example under `~/.cache` or `~/Library`). `ai uninstall --all` lists anything like that for you to check.
+- **Skills in the chat window are unconfirmed with ai-kit's lockdown.** ai-kit sets `ENABLE_PLUGINS=False`; if the Skills workspace or the `$` picker doesn't appear, try `ENABLE_PLUGINS=True` in `webui.env`. Skills attached to a model (rather than picked with `$`) need a model with native tool calling.
 - **Terminal and chat-window memories are separate stores.** They aren't synced, even within the same space.
 
 ## Licence

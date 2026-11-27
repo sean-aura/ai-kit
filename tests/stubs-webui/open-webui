@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Stand-in for Open WebUI: prints the settings it was started with, then exits.
+env | grep -E '^(ENABLE_|OPENAI_API|DATA_DIR|WEBUI_|DEFAULT_)' | sort

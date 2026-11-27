@@ -181,15 +181,25 @@ install_kit() {
   fi
   ln -sf "$kit/bin/ai" "$link"
   # shellcheck disable=SC2016  # written literally into the rc file
-  local rc line='export PATH="$HOME/.local/bin:$PATH"  # ai-kit'
-  case "${SHELL:-}" in */zsh) rc="$HOME/.zshrc" ;; */bash) rc="$HOME/.bashrc" ;; *) rc="$HOME/.profile" ;; esac
-  case ":$PATH:" in
-    *":$HOME/.local/bin:"*) ;;
-    *) if ! grep -qsF '# ai-kit' "$rc"; then
-         if [ -e "$rc" ]; then record rcline "$rc" added existing-file; else record rcline "$rc" added new-file; fi
-         echo "$line" >>"$rc"; say "Added ~/.local/bin to PATH in $rc"
-       fi ;;
+  # New terminals need ~/.local/bin on PATH. Add a guarded line (it does
+  # nothing if the folder is already on PATH) to the file your shell reads,
+  # whether or not this session happens to have it on PATH already.
+  local rc=""
+  # shellcheck disable=SC2016  # written literally into the startup file
+  local line='case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac  # ai-kit'
+  case "${SHELL:-}" in
+    */zsh)  rc="$HOME/.zshrc" ;;
+    */bash) if [ "$os" = Darwin ]; then rc="$HOME/.bash_profile"; else rc="$HOME/.bashrc"; fi ;;  # macOS Terminal opens login shells
+    */fish) rc="" ;;
+    *)      rc="$HOME/.profile" ;;
   esac
+  if [ -z "$rc" ]; then
+    warn "fish shell: ai-kit doesn't edit fish's config. Run once: fish_add_path ~/.local/bin"
+  elif ! grep -qsF '# ai-kit' "$rc"; then
+    if [ -e "$rc" ]; then record rcline "$rc" added existing-file; else record rcline "$rc" added new-file; fi
+    printf '%s\n' "$line" >>"$rc"
+    say "Added ~/.local/bin to PATH in $rc"
+  fi
 
   # Don't report success unless the tools ai-kit needs actually run.
   local uvbin; uvbin="$(uv tool dir --bin 2>/dev/null || echo "$HOME/.local/bin")"
@@ -222,13 +232,25 @@ install_kit() {
     "$kit/bin/ai" sync
   fi
 
+  # This installer can't change the PATH of the terminal that ran it, so say
+  # exactly what to do in this window.
+  local ready
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ready="Ready in this terminal." ;;
+    *) if [ -n "$rc" ]; then ready="To use ai in THIS terminal, run:  source ${rc/#$HOME/\~}
+   (or open a new terminal window)"
+       else ready="Open a new terminal window to use ai."; fi ;;
+  esac
+
   cat <<EOF
 
 ai-kit is installed in $kit  (mode: local, nothing leaves this machine)
 What it added and what it left alone is recorded in $RECEIPT
 ('ai receipt' to view; 'ai uninstall --all --dry-run' to preview removal).
 
-Open a NEW terminal, then:
+>> $ready
+
+Then:
   ai sync       download the local models for this machine (large; needs internet)
   ai doctor     check everything
   ai            pick a role and start chatting

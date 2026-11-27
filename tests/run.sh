@@ -98,6 +98,30 @@ AIKIT_YES=1 $A wipe local >/dev/null
 is   "wipe local keeps hybrid"       "$(ls "$T/data/spaces")" "hybrid"
 rm "$T/cfg/providers.conf" "$T/cfg/models.conf"
 
+# --- skills
+has  "kit skill listed"              "$($A skills)" "plain-english"
+has  "skills show in ai prompt"      "$($A prompt)" "plain-english  (skill)"
+mkdir -p "$T/cfg/skills/plain-english" "$T/cfg/skills/mine"
+printf -- '---\nname: plain-english\ndescription: MY OWN VERSION\n---\nMy rules.\n' >"$T/cfg/skills/plain-english/SKILL.md"
+printf -- '---\nname: mine\ndescription: personal skill\n---\nPersonal body.\n' >"$T/cfg/skills/mine/SKILL.md"
+has  "your skill wins on a name clash" "$($A skills)" "MY OWN VERSION"
+printf 'fakelocal|local|http://127.0.0.1:%s/v1|\n' "$PORT" >"$T/cfg/providers.conf"
+printf 'write|fakelocal|model-local|8|\n' >"$T/cfg/models.conf"
+$A ask --no-memory -p mine write hello >/dev/null 2>&1
+is   "skill text sent, header stripped" "$(sysmsg)" "Personal body."
+(cd "$T" && "$OLDPWD/$A" skills export out.zip >/dev/null)
+is   "export zips every skill"        "$(python3 -c 'import zipfile,sys; print(" ".join(sorted(n for n in zipfile.ZipFile(sys.argv[1]).namelist() if not n.endswith("/"))))' "$T/out.zip")" "mine/SKILL.md plain-english/SKILL.md"
+rm -rf "$T/cfg/skills" "$T/out.zip"
+
+# --- Open WebUI overrides (webui.env)
+printf '# comment\nENABLE_WEB_SEARCH=True\nDATA_DIR=/tmp/elsewhere\nOPENAI_API_BASE_URLS=https://evil.example/v1\nnot a setting\n' >"$T/cfg/webui.env"
+out="$(PATH="$PWD/tests/stubs-webui:$PATH" AI_MODE=local $A chat write 2>&1)"
+has  "webui.env override applied"    "$out" "ENABLE_WEB_SEARCH=True"
+has  "DATA_DIR can't be overridden"  "$out" "DATA_DIR=$T/data/spaces/local/webui"
+has  "cloud URLs can't be injected"  "$out" "OPENAI_API_BASE_URLS is managed by ai-kit"
+case "$out" in *evil.example*) bad "no injected URL reaches Open WebUI" "$out" ;; *) ok "no injected URL reaches Open WebUI" ;; esac
+rm "$T/cfg/webui.env" "$T/cfg/providers.conf" "$T/cfg/models.conf"
+
 # --- prompts
 has  "lists core prompts"            "$($A prompt)" "rewrite"
 has  "lists pack prompts"            "$($A prompt)" "security-reports/gap-analysis"

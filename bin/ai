@@ -254,6 +254,11 @@ stop_server() {
 }
 stop_webui() { pkill -f "open-webui serve" 2>/dev/null || true; }
 
+webui_overrides() {   # KEY=value lines from ~/.config/ai-kit/webui.env
+  if [ -f "$CFG_DIR/webui.env" ]; then
+    sed -e 's/^[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$CFG_DIR/webui.env" | grep -E '^[A-Z][A-Z0-9_]*=' || true
+  fi
+}
 webui_version() { uv tool list 2>/dev/null | awk '$1 == "open-webui" { sub(/^v/, "", $2); print $2 }' || true; }
 
 installed_models() { if server_up; then ollama list 2>/dev/null | awk 'NR > 1 { print $1 }'; fi; }
@@ -272,9 +277,31 @@ prompt_file() {   # name or pack/name -> path
   esac
   return 1
 }
+# ---- skills: Agent Skills format (a folder with SKILL.md), the same format
+# Claude Code and Open WebUI use. Yours in ~/.config/ai-kit/skills win over the kit's.
+skill_path() {
+  local d
+  for d in "$CFG_DIR/skills" "$KIT/skills"; do
+    [ -f "$d/$1/SKILL.md" ] && { echo "$d/$1"; return 0; }
+  done
+  return 1
+}
+skill_names() {
+  local d f
+  for d in "$CFG_DIR/skills" "$KIT/skills"; do
+    for f in "$d"/*/SKILL.md; do [ -f "$f" ] && basename "$(dirname "$f")"; done
+  done | awk '!s[$0]++'
+}
+skill_desc() { awk 'NR == 1 && /^---$/ { fm = 1; next } fm && /^---$/ { exit } fm && sub(/^description:[[:space:]]*/, "") { print; exit }' "$1/SKILL.md"; }
+skill_body() { awk 'NR == 1 && /^---$/ { fm = 1; next } fm && /^---$/ { fm = 0; next } !fm' "$1/SKILL.md"; }
+
 prompt_text() {   # a pack's _rules.md is prepended to every prompt in that pack
   local f d
-  f="$(prompt_file "$1")" || die "no prompt '$1'. List them with: ai prompt"
+  if ! f="$(prompt_file "$1")"; then
+    d="$(skill_path "$1")" || die "no prompt or skill '$1'. List them with: ai prompt"
+    skill_body "$d"   # the terminal uses SKILL.md's text; supporting files aren't loaded
+    return 0
+  fi
   d="$(dirname "$f")"
   [ -f "$d/_rules.md" ] && { cat "$d/_rules.md"; echo; }
   cat "$f"
@@ -423,6 +450,21 @@ cmd_chat() {   # web UI: ai chat [role|model]
   else
     export ENABLE_OPENAI_API=False
   fi
+  # Your Open WebUI overrides (KEY=value lines). Settings that decide the mode,
+  # the space or the cloud connections can't be overridden here.
+  local ov key n_ov=0
+  while IFS= read -r ov; do
+    [ -n "$ov" ] || continue
+    key="${ov%%=*}"
+    case "$key" in
+      DATA_DIR|WEBUI_SECRET_KEY|OLLAMA_BASE_URL|ENABLE_OPENAI_API|OPENAI_API_*|ENABLE_MEMORIES|OFFLINE_MODE)
+        warn "webui.env: $key is managed by ai-kit (mode and space isolation) and was ignored" ;;
+      *) export "${ov?}"; n_ov=$((n_ov + 1)) ;;
+    esac
+  done <<EOF2
+$(webui_overrides)
+EOF2
+  [ "$n_ov" -gt 0 ] && say "Applied $n_ov Open WebUI setting(s) from $CFG_DIR/webui.env"
   [ "$MODE" = hybrid ] && warn "hybrid mode: cloud models in the picker send your prompts and files to that provider."
 
   local port="$OPEN_WEBUI_PORT"
@@ -611,9 +653,10 @@ cmd_prompt() {   # ai prompt [name]
       [ -d "$d" ] || continue; pack="$(basename "$(dirname "$d")")"
       for f in "$d"/*.md; do [ -f "$f" ] || continue; n="$(basename "$f" .md)"; case "$n" in _*) continue ;; esac; say "  $pack/$n"; done
     done
+    for n in $(skill_names); do say "  $n  (skill)"; done
     return 0
   fi
-  prompt_file "$1" >/dev/null || die "no prompt '$1'. List them with: ai prompt"
+  prompt_file "$1" >/dev/null || skill_path "$1" >/dev/null || die "no prompt or skill '$1'. List them with: ai prompt"
   if prompt_text "$1" | clip 2>/dev/null; then
     say "Copied '$1' to the clipboard. Paste it as your first message."
   else
@@ -688,6 +731,55 @@ cmd_log() {   # ai log [on|off]  - terminal prompt history (llm's database)
     "")     say "Prompt logging for ai ask: $( [ "$(cfg_get log)" = off ] && echo off || echo on ) ($SPACE/llm)" ;;
     on|off) cfg_set log "$1"; say "Prompt logging $1." ;;
     *)      die "usage: ai log [on|off]" ;;
+  esac
+}
+
+# ------------------------------------------------------------ skills
+cmd_skills() {   # ai skills [claude [--remove] | export [file.zip]]
+  local n d dest cs out tmp
+  case "${1:-}" in
+    "")
+      [ -n "$(skill_names)" ] || { say "No skills yet. Add folders with a SKILL.md to $CFG_DIR/skills/ (yours) or $KIT/skills/ (team)."; return 0; }
+      for n in $(skill_names); do
+        d="$(skill_path "$n")"
+        printf '  %-22s %s\n' "$n" "$(skill_desc "$d")"
+        case "$d" in "$CFG_DIR"/*) printf '  %-22s (yours: %s)\n' "" "$d" ;; esac
+      done
+      say ""; say "Use: ai ask -p <skill> ...  |  ai skills claude (Claude Code)  |  ai skills export (chat window)" ;;
+    claude)
+      cs="$HOME/.claude/skills"
+      if [ "${2:-}" = --remove ]; then
+        for dest in $(rc_names claude_skill added); do
+          if [ -L "$dest" ]; then rm -f "$dest"; say "unlinked $dest"; fi
+        done
+        rmdir "$cs" 2>/dev/null || true
+        return 0
+      fi
+      [ -d "$HOME/.claude" ] || have claude || die "Claude Code not found (no ~/.claude folder). Install it, then run this again."
+      for d in "$HOME/.claude" "$cs"; do
+        if [ -d "$d" ]; then rc_record dir "$d" preexisting; else rc_record dir "$d" added; fi
+      done
+      mkdir -p "$cs"
+      for n in $(skill_names); do
+        d="$(skill_path "$n")"; dest="$cs/$n"
+        if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$d" ]; then say "  ok      $n (already linked)"
+        elif [ -e "$dest" ] || [ -L "$dest" ]; then say "  skip    $n: you already have a Claude Code skill with that name (left alone)"
+        else ln -s "$d" "$dest"; rc_record_added claude_skill "$dest"; say "  linked  $n -> $dest"; fi
+      done
+      say "Claude Code picks these up in new sessions (and live, once ~/.claude/skills exists). Remove with: ai skills claude --remove" ;;
+    export)
+      out="${2:-ai-kit-skills.zip}"; case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
+      [ -n "$(skill_names)" ] || die "no skills to export"
+      tmp="$(mktemp -d)"
+      for n in $(skill_names); do cp -R "$(skill_path "$n")" "$tmp/$n"; done
+      rm -f "$out"
+      if have zip; then (cd "$tmp" && zip -qr "$out" .)
+      else python3 -c 'import shutil,sys; shutil.make_archive(sys.argv[1][:-4], "zip", sys.argv[2])' "$out" "$tmp"; fi
+      rm -rf "$tmp"
+      say "Wrote $out"
+      say "In the chat window: Workspace > Skills > Import, choose this file. Type \$ in a chat to use one."
+      say "Local and hybrid mode have separate chat windows, so import into each one you use." ;;
+    *) die "usage: ai skills [claude [--remove] | export [file.zip]]" ;;
   esac
 }
 
@@ -774,6 +866,9 @@ cmd_doctor() {
   else say "Open WebUI: $v is BELOW the required $OPEN_WEBUI_MIN - run: ai update"; fi
   have llm && say "llm      $(llm --version 2>/dev/null)"
   check_config || true
+  if [ -n "$(webui_overrides)" ]; then
+    say "Open WebUI overrides from $CFG_DIR/webui.env:"; webui_overrides | sed 's/^/  /'
+  fi
 
   start_server
   if grep -qi 'cloud disabled: true' "$DATA/ollama.log" 2>/dev/null || grep -q '"disable_ollama_cloud": *true' "$HOME/.ollama/server.json" 2>/dev/null; then
@@ -954,6 +1049,10 @@ cmd_uninstall() {   # ai uninstall [--all] [--dry-run]
   if [ $all = 1 ]; then
     for x in $(rc_names uv_python added); do act "remove Python $x (downloaded by uv)" uv python uninstall "$x"; done
   fi
+  # 3b. skill links ai-kit added to Claude Code
+  for x in $(rc_names claude_skill added); do
+    if [ -L "$x" ]; then act "remove Claude Code skill link $x" rm -f "$x"; fi
+  done
   # 4. the ai link (put yours back) and the PATH line
   x="$HOME/.local/bin/ai"
   case "$(rc_status link "$x")" in
@@ -1054,8 +1153,11 @@ Memory and privacy  (local and hybrid mode each have their own space)
 
   target = a role (chat, write, code, vision, image), provider/model, or an Ollama tag
 
-Writing helpers
-  ai prompt [name]            list saved prompts, or copy one to the clipboard
+Prompts and skills
+  ai prompt [name]            list prompts and skills, or copy one to the clipboard
+  ai skills                   list skills (SKILL.md folders in skills/ and ~/.config/ai-kit/skills/)
+  ai skills claude [--remove] link them into Claude Code (~/.claude/skills)
+  ai skills export [file.zip] zip them for the chat window (Workspace > Skills > Import)
   ai docx file.md [tpl.docx]  Markdown -> Word        ai ocr scan.pdf   make a scan readable
 
 Models
@@ -1122,6 +1224,7 @@ main() {
     import)     cmd_import "$@" ;;
     uninstall)  cmd_uninstall "$@" ;;
     receipt)    cmd_receipt ;;
+    skills|skill) cmd_skills "$@" ;;
     help|-h|--help) usage ;;
     *)          usage; exit 1 ;;
   esac
