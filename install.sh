@@ -34,6 +34,15 @@ record() {
   mkdir -p "$CFG_DIR"
   printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "${4:-}" >>"$RECEIPT"
 }
+# ai-kit just created this because it was missing, so it's ai-kit's now,
+# whatever an older record says (e.g. after `ai uninstall` and a reinstall).
+record_added() {
+  if receipt_has "$1" "$2"; then
+    grep -v "^$1|$2|" "$RECEIPT" >"$RECEIPT.tmp" || true
+    mv "$RECEIPT.tmp" "$RECEIPT"
+  fi
+  record "$1" "$2" added "${3:-}"
+}
 record_path() {   # record_path kind path: added unless it already exists
   if [ -e "$2" ] || [ -L "$2" ]; then record "$1" "$2" preexisting; else record "$1" "$2" added; fi
 }
@@ -135,18 +144,21 @@ install_kit() {
   local tool spec
   for tool in open-webui llm; do
     spec="$tool"; [ "$tool" = open-webui ] && spec="open-webui>=$OPEN_WEBUI_MIN"
-    if receipt_has uv_tool "$tool" && grep -q "^uv_tool|$tool|added|" "$RECEIPT"; then
-      uv tool upgrade --quiet "$tool" || true                     # ours: keep it current
-    elif uv tool list 2>/dev/null | grep -q "^$tool "; then
-      record uv_tool "$tool" preexisting
-      say "$tool is already installed with uv: leaving your copy as it is"
+    # Decide by what is actually installed now; the receipt only labels it.
+    if uv tool list 2>/dev/null | grep -q "^$tool "; then
+      if grep -q "^uv_tool|$tool|added|" "$RECEIPT" 2>/dev/null; then
+        uv tool upgrade --quiet "$tool" || warn "could not upgrade $tool"   # ai-kit's copy: keep it current
+      else
+        record uv_tool "$tool" preexisting
+        say "$tool is already installed with uv: leaving your copy as it is"
+      fi
     elif have "$tool"; then
       record uv_tool "$tool" preexisting external
       say "$tool is already installed (not via uv): leaving your copy as it is"
     else
       say "Installing $tool with uv"
-      uv tool install --quiet --python "$PYTHON_VERSION" "$spec"
-      record uv_tool "$tool" added
+      uv tool install --quiet --python "$PYTHON_VERSION" "$spec" || die "uv could not install $tool (see the message above)"
+      record_added uv_tool "$tool"
     fi
   done
   after="$(names_in "$pydir")"
@@ -178,6 +190,14 @@ install_kit() {
          echo "$line" >>"$rc"; say "Added ~/.local/bin to PATH in $rc"
        fi ;;
   esac
+
+  # Don't report success unless the tools ai-kit needs actually run.
+  local uvbin; uvbin="$(uv tool dir --bin 2>/dev/null || echo "$HOME/.local/bin")"
+  for tool in open-webui llm; do
+    if ! PATH="$uvbin:$HOME/.local/bin:$PATH" command -v "$tool" >/dev/null 2>&1; then
+      die "$tool is not installed or not runnable. Try: uv tool install --python $PYTHON_VERSION $tool  (then re-run this installer)"
+    fi
+  done
 
   # Belt and braces: switch off Ollama's cloud features in its own settings
   # file too, so it also applies if the Ollama desktop app is ever started.

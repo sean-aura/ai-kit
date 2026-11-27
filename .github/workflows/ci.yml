@@ -1,0 +1,22 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck -s bash bin/ai install.sh tests/*.sh tests/stubs/*
+      - name: install llm
+        run: pipx install llm
+      - name: offline tests (macOS runs them under the system bash 3.2)
+        run: /bin/bash tests/run.sh
+      - name: clean-slate install/uninstall test
+        run: /bin/bash tests/clean_slate.sh

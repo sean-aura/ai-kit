@@ -27,6 +27,13 @@ OLLAMA_ADDR="${AI_OLLAMA_ADDR:-$OLLAMA_ADDR}"
 OLLAMA_URL="http://$OLLAMA_ADDR"
 KEYCHAIN_SERVICE="ai-kit"
 OS="$(uname -s)"
+# Tools installed with uv (open-webui, llm) live in uv's bin folder; make sure
+# ai finds them even if that folder isn't on your PATH.
+if command -v uv >/dev/null 2>&1; then
+  UV_BIN="$(uv tool dir --bin 2>/dev/null || true)"
+  [ -n "$UV_BIN" ] && PATH="$UV_BIN:$PATH"
+fi
+PATH="$HOME/.local/bin:$PATH"
 # Folders are created only when something is written, so read-only commands
 # (help, receipt, a dry run) leave no trace.
 data_dir()  { mkdir -p "$DATA" && chmod 700 "$DATA"; }
@@ -165,6 +172,13 @@ rc_record() {
   [ -n "$(rc_get "$1" "$2")" ] && return 0
   mkdir -p "$CFG_DIR"
   printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "${4:-}" >>"$RECEIPT"
+}
+rc_record_added() {   # ai-kit just created it, so it's ai-kit's whatever an older record says
+  if [ -n "$(rc_get "$1" "$2")" ]; then
+    grep -v "^$1|$2|" "$RECEIPT" >"$RECEIPT.tmp" || true
+    mv "$RECEIPT.tmp" "$RECEIPT"
+  fi
+  rc_record "$1" "$2" added "${3:-}"
 }
 rc_names() { if [ -f "$RECEIPT" ]; then awk -F'|' -v k="$1" -v s="$2" '$1 == k && $3 == s { print $2 }' "$RECEIPT"; fi; }
 rc_status() { local r; r="$(rc_get "$1" "$2")"; echo "${r%%|*}"; }
@@ -349,7 +363,7 @@ cmd_repl() { llm_run chat "$@"; }
 
 cmd_chat() {   # web UI: ai chat [role|model]
   local target="${1:-chat}" pm model v secret
-  have open-webui || die "open-webui missing. Re-run install.sh"
+  have open-webui || die "open-webui is not installed. Re-run the installer, or: uv tool install --python $PYTHON_VERSION \"open-webui>=$OPEN_WEBUI_MIN\""
   v="$(webui_version)"
   if [ -n "$v" ] && ! version_ge "$v" "$OPEN_WEBUI_MIN"; then
     die "Open WebUI $v is older than the required $OPEN_WEBUI_MIN (security fixes). Run: ai update"
@@ -462,9 +476,10 @@ cmd_image() {   # ai image [--cloud] [-o dir] "description"
   if [ "$p" = ollama ]; then
     is_mac || die "Ollama image generation is macOS-only for now. Use: ai image --cloud \"...\" (hybrid mode)"
     prepare "$p"
-    if is_installed "$m"; then rc_record ollama_model "$(norm "$m")" preexisting; fi
+    local had=0
+    if is_installed "$m"; then had=1; rc_record ollama_model "$(norm "$m")" preexisting; fi
     (cd "$out" && ollama run "$m" "$*")
-    if is_installed "$m"; then rc_record ollama_model "$(norm "$m")" added; fi
+    if [ "$had" = 0 ] && is_installed "$m"; then rc_record_added ollama_model "$(norm "$m")"; fi
   elif [ "$p" = openai ]; then
     prepare "$p"
     f="$out/image-$(date +%Y%m%d-%H%M%S).png"
@@ -518,9 +533,11 @@ cmd_sync() {   # ai sync [--all]
   done
   wanted_models "$all" | while IFS='|' read -r role m; do
     if [ "$role" = image ] && ! is_mac; then say "skip   $m (image generation is macOS-only)"; continue; fi
-    if is_installed "$m"; then rc_record ollama_model "$(norm "$m")" preexisting; fi
+    local had=0
+    if is_installed "$m"; then had=1; rc_record ollama_model "$(norm "$m")" preexisting; fi
     say "pull   $m  ($role)"
-    if ollama pull "$m" </dev/null; then rc_record ollama_model "$(norm "$m")" added
+    if ollama pull "$m" </dev/null; then
+      [ "$had" = 0 ] && rc_record_added ollama_model "$(norm "$m")"
     else say "FAILED $m - check the tag in models.conf"; fi
   done
 }

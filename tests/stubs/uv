@@ -3,6 +3,7 @@
 S="$STUB_STATE/uv"; PY="$HOME/.local/share/uv/python"
 case "${1:-} ${2:-}" in
   "python dir") echo "$PY" ;;
+  "tool dir") echo "$HOME/.local/bin" ;;   # as `uv tool dir --bin`
   "python uninstall") rm -rf "${PY:?}/$3" ;;
   "tool list") for t in "$S"/tools/*; do [ -e "$t" ] || continue; echo "${t##*/} v1.0"; echo "- ${t##*/}"; done ;;
   "tool install")

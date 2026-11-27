@@ -63,6 +63,11 @@ run_machine() {   # run_machine NAME SETUP_FUNCTION
 setup_fresh() { :; }
 check_fresh() {
   local A="$1" R="$2" before="$3" mid
+  # Uninstall then reinstall (a common "turn it off and on again") must bring every tool back.
+  "$A" uninstall >"$L/uninstall0.log" 2>&1
+  AIKIT_REPO="file://$W/repo" bash <"$W/repo/install.sh" >"$L/install3.log" 2>&1 || bad "fresh: reinstall after uninstall" "$(tail -5 "$L/install3.log")"
+  if PATH="$HOME/.local/bin:$PATH" command -v open-webui >/dev/null && PATH="$HOME/.local/bin:$PATH" command -v llm >/dev/null; then ok "fresh: reinstall after uninstall brings open-webui and llm back"
+  else bad "fresh: reinstall restores tools" "$(ls -la "$HOME/.local/bin")"; fi
   mid="$(snapshot "$R")"
   "$A" uninstall --all --dry-run >"$L/dry.log" 2>&1
   same "fresh: dry run changes nothing" "$mid" "$(snapshot "$R")"

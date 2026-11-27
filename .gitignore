@@ -1,0 +1,6 @@
+# model archives made by `ai export`
+*.tar
+# never commit keys or personal settings
+keys.env
+*.local.conf
+.DS_Store
